@@ -1,11 +1,12 @@
+Token_Github*
+*.out
+*.DAT
+*.zip
+dist/
+build/
 __pycache__/
 *.pyc
 *.pyo
-*.exe
-dist/
-build/
-*.spec
 venv/
 .venv/
 topsio_env/
-*.zip
