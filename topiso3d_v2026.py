@@ -3,6 +3,7 @@
 
 """
 TopIso3D v2026 - Workspace + TRHO Runner (auto-validate, no Validate button)
+# Test modification for pull request
 
 Fluxo:
 1) Choose folder…
