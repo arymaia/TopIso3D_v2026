@@ -4,6 +4,10 @@ Token_Github*
 *.zip
 dist/
 build/
+release/
+*.exe
+*.AppImage
+*.spec
 __pycache__/
 *.pyc
 *.pyo
