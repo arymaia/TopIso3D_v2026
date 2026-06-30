@@ -464,6 +464,87 @@ def find_splash_logo_path() -> Optional[Path]:
                     pass
     return None
 
+
+
+def find_app_icon_path() -> Optional[Path]:
+    """Return the best bundled/local TopIso3D icon for application windows.
+
+    On Windows, Tk prefers .ico via iconbitmap().  For source and PyInstaller
+    runs we also keep PNG fallbacks so the same function works on Linux/macOS.
+    """
+    base_dirs: List[Path] = []
+    for d in (get_runtime_base_dir(), Path(__file__).resolve().parent, Path.cwd()):
+        try:
+            p = Path(d).expanduser().resolve()
+            if p not in base_dirs:
+                base_dirs.append(p)
+        except Exception:
+            pass
+
+    names = [
+        "topiso3d.ico",
+        "TopIso3D.ico",
+        "icon.ico",
+        "topiso3d_logo.png",
+        "icon_256x256.png",
+        "icon_128x128@2x.png",
+        "icon_128x128.png",
+        "icon_512x512.png",
+        "icon.png",
+    ]
+    subdirs = [Path(""), Path("assets"), Path("icons"), Path("topiso3d.iconset")]
+    for base in base_dirs:
+        for sub in subdirs:
+            for name in names:
+                cand = base / sub / name
+                try:
+                    if cand.exists() and cand.is_file():
+                        return cand
+                except Exception:
+                    pass
+    return None
+
+
+def apply_topiso3d_window_icon(win: tk.Misc) -> None:
+    """Apply the TopIso3D icon to a Tk/Toplevel window without changing focus.
+
+    This function intentionally does not call lift(), focus_force(), or topmost.
+    """
+    try:
+        icon_path = find_app_icon_path()
+        if icon_path is None:
+            return
+
+        if is_windows() and icon_path.suffix.lower() == ".ico":
+            try:
+                win.iconbitmap(str(icon_path))
+                return
+            except Exception:
+                pass
+
+        try:
+            img = tk.PhotoImage(file=str(icon_path))
+            win.iconphoto(True, img)
+            try:
+                setattr(win, "_topiso3d_icon_img", img)
+            except Exception:
+                pass
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def configure_windows_app_id() -> None:
+    """Set a stable Windows AppUserModelID for taskbar grouping/icon selection."""
+    if not is_windows():
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("TopIso3D.v2026")
+    except Exception:
+        pass
+
 def get_platform_name() -> str:
     """Return a normalized platform name: linux, windows or macos."""
     sys_name = platform.system().lower()
@@ -2814,6 +2895,7 @@ class SettingsDialog(tk.Toplevel):
         self.app = app
         _ensure_floating_window(self)
         self.title("Settings")
+        apply_topiso3d_window_icon(self)
         self.resizable(False, False)
         self.transient(app)
         self.grab_set()
@@ -3061,6 +3143,7 @@ class _RunNameDialog(tk.Toplevel):
         self.parent = parent
         self.result = None
         self.title(title)
+        apply_topiso3d_window_icon(self)
         self.resizable(False, False)
         self.transient(parent)
         self.grab_set()
@@ -3174,7 +3257,9 @@ class App(tk.Tk):
         self._splash_logo_img = None
 
         _ensure_floating_window(self)
+        configure_windows_app_id()
         self.title("TopIso3D v2026")
+        apply_topiso3d_window_icon(self)
         self._show_startup_splash()
 
         self.geometry("1180x800")
@@ -3263,10 +3348,14 @@ class App(tk.Tk):
             splash = tk.Toplevel(self)
             self._splash_win = splash
             splash.title("TopIso3D v2026")
+            apply_topiso3d_window_icon(splash)
             splash.configure(bg=UI_BG_MAIN)
             splash.resizable(False, False)
+            # Do not mark the splash as topmost. On Windows/macOS, a topmost
+            # splash can leave the main window behaving as if it were always
+            # above other applications after startup.
             try:
-                splash.attributes("-topmost", True)
+                splash.attributes("-topmost", False)
             except Exception:
                 pass
             try:
@@ -3394,7 +3483,10 @@ class App(tk.Tk):
 
         try:
             self.deiconify()
-            self.lift()
+            try:
+                self.attributes("-topmost", False)
+            except Exception:
+                pass
         except Exception:
             pass
         try:
@@ -3744,6 +3836,7 @@ class App(tk.Tk):
             self._task_win = tk.Toplevel(self)
             _ensure_floating_window(self._task_win)
             self._task_win.title("Task Details")
+            apply_topiso3d_window_icon(self._task_win)
             self._task_win.geometry("560x360")
             self._task_win.protocol("WM_DELETE_WINDOW", self._task_win.withdraw)
 
@@ -3776,7 +3869,10 @@ class App(tk.Tk):
 
         self._update_task_details_window()
         self._task_win.deiconify()
-        self._task_win.lift()
+        try:
+            self._task_win.attributes("-topmost", False)
+        except Exception:
+            pass
 
     def task_log(self, line: str):
         if getattr(self, "_task_win", None) is not None and self._task_win.winfo_exists():
@@ -15014,8 +15110,11 @@ class ReportsPage(ttk.Frame):
         try:
             win = getattr(self.app, "_report_viewer_win", None)
             if win is not None and win.winfo_exists():
-                win.lift()
-                win.focus_force()
+                try:
+                    win.deiconify()
+                    win.attributes("-topmost", False)
+                except Exception:
+                    pass
                 try:
                     win.refresh()
                 except Exception:

@@ -7,7 +7,6 @@ build/
 release/
 *.exe
 *.AppImage
-*.spec
 __pycache__/
 *.pyc
 *.pyo
@@ -15,4 +14,5 @@ venv/
 .venv/
 topsio_env/
 .idea/
+venv_topiso3d_v2026/
 github-recovery-codes.txt
