@@ -25,12 +25,14 @@ Para usar com TRHO real:
 from __future__ import annotations
 
 import os
+import platform
 import time
 import queue
 import shutil
 import json
 import threading
 import subprocess
+import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Dict, Callable, List, Tuple
@@ -39,7 +41,7 @@ import re
 import pandas as pd
 import numpy as np
 
-# Plotting (PL2D Viewer)
+
 import plotly.graph_objects as go
 import plotly.express as px
 import plotly.colors as pc
@@ -47,6 +49,7 @@ import plotly.colors as pc
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
+from tkinter import font as tkfont
 
 
 class _TolPromptDialog(simpledialog.Dialog):
@@ -164,40 +167,40 @@ class _TolPromptDialog(simpledialog.Dialog):
 import traceback
 import webbrowser
 import tempfile
-# ----------------------------
+import sys
+
 from datetime import datetime
 
-# -----------------------------
-# Window manager helpers
-# -----------------------------
+
 def _ensure_floating_window(win: tk.Misc) -> None:
     """Best-effort: ensure a Tk/Toplevel has normal decorations and can be moved.
 
     On some VM/window-manager combinations (and occasionally after PyInstaller
     builds), Tk windows may appear borderless/undecorated, which also makes
-    dialogs feel "stuck". Explicitly disabling override-redirect and fullscreen
-    usually restores the title bar and window borders.
+    dialogs feel "stuck". The implementation below keeps Linux/Windows behavior
+    while avoiding X11-only hints on macOS.
     """
     try:
-        # Allow WM decorations (title bar, borders, close button).
+
         try:
             win.wm_overrideredirect(False)
         except Exception:
             pass
 
-        # Ensure we are not in a fullscreen state.
+
         try:
             win.attributes("-fullscreen", False)
         except Exception:
             pass
 
-        # Hint: treat as normal window type (supported by some X11 WMs).
-        try:
-            win.wm_attributes("-type", "normal")
-        except Exception:
-            pass
 
-        # Force WM to re-evaluate geometry/decorations.
+        if is_linux():
+            try:
+                win.wm_attributes("-type", "normal")
+            except Exception:
+                pass
+
+
         try:
             win.update_idletasks()
         except Exception:
@@ -205,27 +208,452 @@ def _ensure_floating_window(win: tk.Misc) -> None:
     except Exception:
         pass
 
-# ----------------------------
-# Settings (Phase 0 - minimal)
-# ----------------------------
+
+def _windows_subprocess_silent_kwargs() -> dict:
+    """Return subprocess kwargs that hide console windows on Windows.
+
+    Use this whenever we launch the console-based properties executable from the GUI.
+    On Linux/macOS it returns an empty dict.
+    """
+    if not is_windows():
+        return {}
+    kw = {}
+    try:
+        kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    except Exception:
+        pass
+    try:
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
+        startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+        kw["startupinfo"] = startupinfo
+    except Exception:
+        pass
+    return kw
+
+
+def _best_effort_make_executable(path_like: str | os.PathLike | None) -> Optional[Path]:
+    """Resolve an executable path and, on Unix-like systems, ensure it is runnable.
+
+    This is intentionally best-effort: it never raises just because chmod was not
+    possible. On Windows we leave the file unchanged.
+    """
+    resolved = resolve_executable(path_like)
+    if resolved is None:
+        return None
+    if is_windows():
+        return resolved
+    try:
+        mode = resolved.stat().st_mode
+        if not os.access(str(resolved), os.X_OK):
+            resolved.chmod(mode | 0o111)
+    except Exception:
+        pass
+    return resolved
+
+
+def _open_file_uri_in_browser(target: Path) -> bool:
+    """Open a local HTML file in the default browser across platforms."""
+    target = Path(target).expanduser().resolve()
+    uri = target.as_uri()
+    try:
+        if webbrowser.open_new_tab(uri):
+            return True
+    except Exception:
+        pass
+
+    try:
+        if is_macos():
+            subprocess.Popen(["open", str(target)])
+            return True
+        if is_windows():
+            os.startfile(str(target))
+            return True
+
+
+        subprocess.Popen(["xdg-open", str(target)])
+        return True
+    except Exception:
+        return False
+
+
+def _show_plotly_figure(fig, *, saved_html: Path | None = None) -> None:
+    """Open a Plotly figure in a browser using a robust local file path.
+
+    Temporary previews are stored under the user's TopIso3D config directory instead
+    of /tmp. This avoids issues with browsers/sandboxes that may not resolve transient
+    files created in /tmp fast enough or at all.
+    """
+    if saved_html is not None:
+        saved_html = Path(saved_html).expanduser().resolve()
+        fig.write_html(str(saved_html), include_plotlyjs=True, auto_open=False)
+        if not _open_file_uri_in_browser(saved_html):
+            raise RuntimeError(f"Could not open HTML viewer: {saved_html}")
+        return
+
+    tmp_dir = get_public_preview_dir(APP_NAME)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    tmp = tmp_dir / f"topiso3d_plotly_{os.getpid()}_{int(time.time() * 1000)}.html"
+    fig.write_html(str(tmp), include_plotlyjs=True, auto_open=False)
+    if not tmp.exists():
+        raise RuntimeError(f"Temporary Plotly HTML was not created: {tmp}")
+    if not _open_file_uri_in_browser(tmp):
+        raise RuntimeError(f"Could not open Plotly figure in the system browser: {tmp}")
+
+
+def is_frozen_app() -> bool:
+    """Return True when running from a frozen bundle/executable."""
+    return bool(getattr(sys, "frozen", False))
+
+
+def get_runtime_base_dir() -> Path:
+    """Return the runtime base dir, including PyInstaller bundles."""
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        try:
+            return Path(meipass).resolve()
+        except Exception:
+            return Path(meipass)
+    return Path(__file__).resolve().parent
+
+
+def collect_system_diagnostics(app: Optional["App"] = None) -> dict:
+    """Collect lightweight diagnostics useful for first real Mac tests."""
+    diag = {
+        "platform_name": get_platform_name(),
+        "platform_system": platform.system(),
+        "platform_release": platform.release(),
+        "platform_version": platform.version(),
+        "machine": platform.machine(),
+        "processor": platform.processor(),
+        "python_executable": sys.executable,
+        "python_version": sys.version.replace("\n", " "),
+        "tk_patchlevel": "",
+        "tk_scaling": "",
+        "requested_tk_scaling": "",
+        "screen_width_px": "",
+        "screen_height_px": "",
+        "screen_fpixels_1i": "",
+        "runtime_base_dir": str(get_runtime_base_dir()),
+        "is_frozen": is_frozen_app(),
+        "cwd": str(Path.cwd()),
+        "config_dir": str(_config_dir()),
+        "properties_configured": "",
+        "properties_resolved": "",
+        "workspace_dir": "",
+        "workspace_exists": "",
+        "workspace_writable": "",
+    }
+    try:
+        diag["tk_patchlevel"] = str(tk.Tcl().eval("info patchlevel"))
+    except Exception:
+        pass
+    if app is not None:
+        try:
+            diag["tk_scaling"] = str(app.tk.call("tk", "scaling"))
+        except Exception:
+            pass
+        try:
+            req = get_requested_tk_scaling()
+            diag["requested_tk_scaling"] = str(req if req is not None else "native")
+        except Exception:
+            pass
+        try:
+            diag["screen_width_px"] = str(app.winfo_screenwidth())
+            diag["screen_height_px"] = str(app.winfo_screenheight())
+            diag["screen_fpixels_1i"] = str(app.winfo_fpixels("1i"))
+        except Exception:
+            pass
+        try:
+            pexe = getattr(app.state, "properties_exe", None)
+            diag["properties_configured"] = str(pexe or "")
+            resolved = resolve_executable(str(pexe or "").strip())
+            diag["properties_resolved"] = str(resolved or "")
+        except Exception:
+            pass
+        try:
+            ws = getattr(app.state, "workspace_dir", None)
+            diag["workspace_dir"] = str(ws or "")
+            if ws:
+                wsp = Path(ws)
+                diag["workspace_exists"] = str(wsp.exists())
+                diag["workspace_writable"] = str(os.access(str(wsp), os.W_OK))
+        except Exception:
+            pass
+    return diag
+
+
+def format_system_diagnostics(diag: dict) -> str:
+    order = [
+        "platform_name",
+        "platform_system",
+        "platform_release",
+        "platform_version",
+        "machine",
+        "processor",
+        "python_executable",
+        "python_version",
+        "tk_patchlevel",
+        "tk_scaling",
+        "requested_tk_scaling",
+        "screen_width_px",
+        "screen_height_px",
+        "screen_fpixels_1i",
+        "runtime_base_dir",
+        "is_frozen",
+        "cwd",
+        "config_dir",
+        "properties_configured",
+        "properties_resolved",
+        "workspace_dir",
+        "workspace_exists",
+        "workspace_writable",
+    ]
+    lines = ["TopIso3D diagnostics", "====================", ""]
+    for key in order:
+        val = diag.get(key, "")
+        lines.append(f"{key}: {val}")
+    return "\n".join(lines)
+
+
 APP_NAME = "TopIso3D"
 SETTINGS_FILENAME = "settings.json"
 
-def _config_dir() -> Path:
-    """Return per-user config dir (Linux-friendly, Windows/macOS fallback)."""
+
+SPLASH_MIN_VISIBLE_MS = 1500
+SPLASH_LOGO_MAX_PX = 128
+
+
+def find_splash_logo_path() -> Optional[Path]:
+    """Return a bundled/local TopIso3D logo image for the startup splash.
+
+    The lookup is intentionally flexible so development runs in PyCharm, source
+    distributions, and PyInstaller bundles can all use the same code. Preferred
+    names are checked first; if no dedicated splash image is found, the macOS
+    iconset PNGs are used as a fallback.
+    """
+    base_dirs: List[Path] = []
+    for d in (get_runtime_base_dir(), Path(__file__).resolve().parent, Path.cwd()):
+        try:
+            p = Path(d).expanduser().resolve()
+            if p not in base_dirs:
+                base_dirs.append(p)
+        except Exception:
+            pass
+
+    names = [
+        "topiso3d_splash.png",
+        "splash_logo.png",
+        "topiso3d_logo.png",
+        "icon_256x256.png",
+        "icon_128x128@2x.png",
+        "icon_128x128.png",
+        "icon_512x512.png",
+        "icon.png",
+    ]
+    subdirs = [Path(""), Path("assets"), Path("icons"), Path("topiso3d.iconset")]
+
+    for base in base_dirs:
+        for sub in subdirs:
+            for name in names:
+                cand = base / sub / name
+                try:
+                    if cand.exists() and cand.is_file():
+                        return cand
+                except Exception:
+                    pass
+    return None
+
+
+
+def find_app_icon_path() -> Optional[Path]:
+    """Return the best bundled/local TopIso3D icon for application windows.
+
+    On Windows, Tk prefers .ico via iconbitmap().  For source and PyInstaller
+    runs we also keep PNG fallbacks so the same function works on Linux/macOS.
+    """
+    base_dirs: List[Path] = []
+    for d in (get_runtime_base_dir(), Path(__file__).resolve().parent, Path.cwd()):
+        try:
+            p = Path(d).expanduser().resolve()
+            if p not in base_dirs:
+                base_dirs.append(p)
+        except Exception:
+            pass
+
+    names = [
+        "topiso3d.ico",
+        "TopIso3D.ico",
+        "icon.ico",
+        "topiso3d_logo.png",
+        "icon_256x256.png",
+        "icon_128x128@2x.png",
+        "icon_128x128.png",
+        "icon_512x512.png",
+        "icon.png",
+    ]
+    subdirs = [Path(""), Path("assets"), Path("icons"), Path("topiso3d.iconset")]
+    for base in base_dirs:
+        for sub in subdirs:
+            for name in names:
+                cand = base / sub / name
+                try:
+                    if cand.exists() and cand.is_file():
+                        return cand
+                except Exception:
+                    pass
+    return None
+
+
+def apply_topiso3d_window_icon(win: tk.Misc) -> None:
+    """Apply the TopIso3D icon to a Tk/Toplevel window without changing focus.
+
+    This function intentionally does not call lift(), focus_force(), or topmost.
+    """
+    try:
+        icon_path = find_app_icon_path()
+        if icon_path is None:
+            return
+
+        if is_windows() and icon_path.suffix.lower() == ".ico":
+            try:
+                win.iconbitmap(str(icon_path))
+                return
+            except Exception:
+                pass
+
+        try:
+            img = tk.PhotoImage(file=str(icon_path))
+            win.iconphoto(True, img)
+            try:
+                setattr(win, "_topiso3d_icon_img", img)
+            except Exception:
+                pass
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def configure_windows_app_id() -> None:
+    """Set a stable Windows AppUserModelID for taskbar grouping/icon selection."""
+    if not is_windows():
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("TopIso3D.v2026")
+    except Exception:
+        pass
+
+def get_platform_name() -> str:
+    """Return a normalized platform name: linux, windows or macos."""
+    sys_name = platform.system().lower()
+    if sys_name.startswith("win"):
+        return "windows"
+    if sys_name == "darwin":
+        return "macos"
+    return "linux"
+
+def is_windows() -> bool:
+    return get_platform_name() == "windows"
+
+def is_macos() -> bool:
+    return get_platform_name() == "macos"
+
+def is_linux() -> bool:
+    return get_platform_name() == "linux"
+
+
+DEFAULT_MACOS_TK_SCALING = 1.25
+
+
+def get_requested_tk_scaling() -> Optional[float]:
+    """Return the requested Tk scaling factor for this platform.
+
+    On Linux/Windows we leave Tk's native scaling untouched. On macOS we apply a
+    conservative Retina/HiDPI adjustment. The environment variable
+    TOPISO3D_TK_SCALING can be used during tests to override the default value.
+    """
+    raw = os.environ.get("TOPISO3D_TK_SCALING", "").strip()
+    if raw:
+        try:
+            val = float(raw.replace(",", "."))
+            if 0.75 <= val <= 2.50:
+                return val
+        except Exception:
+            pass
+    if is_macos():
+        return DEFAULT_MACOS_TK_SCALING
+    return None
+
+
+def apply_platform_ui_scaling(root: tk.Misc) -> Optional[float]:
+    """Apply conservative platform-specific Tk scaling and return the applied value."""
+    requested = get_requested_tk_scaling()
+    if requested is None:
+        return None
+    try:
+        root.tk.call("tk", "scaling", float(requested))
+        return float(root.tk.call("tk", "scaling"))
+    except Exception:
+        return None
+
+def get_user_config_dir(app_name: str = APP_NAME) -> Path:
+    """Return the per-user config directory following native OS conventions."""
+    if is_windows():
+        base = os.environ.get("APPDATA")
+        if base:
+            return Path(base) / app_name
+        return Path.home() / "AppData" / "Roaming" / app_name
+
+    if is_macos():
+        return Path.home() / "Library" / "Application Support" / app_name
+
     xdg = os.environ.get("XDG_CONFIG_HOME")
     base = Path(xdg) if xdg else (Path.home() / ".config")
-    d = base / APP_NAME
+    return base / app_name
+
+def _config_dir() -> Path:
+    """Return per-user config dir with a resilient fallback for all platforms."""
+    d = get_user_config_dir(APP_NAME)
     try:
         d.mkdir(parents=True, exist_ok=True)
     except Exception:
-        # Fallback to home dir (best-effort)
         d = Path.home() / f".{APP_NAME.lower()}"
         d.mkdir(parents=True, exist_ok=True)
     return d
 
 def settings_path() -> Path:
     return _config_dir() / SETTINGS_FILENAME
+
+
+def get_public_preview_dir(app_name: str = APP_NAME) -> Path:
+    """Return a browser-friendly preview folder for temporary HTML plots.
+
+    On Linux, browsers distributed as Snap/Flatpak often cannot open files inside
+    hidden directories such as ~/.config. We therefore prefer a visible location
+    under ~/Documents when possible.
+    """
+    home = Path.home()
+    candidates = []
+    docs = home / "Documents"
+    if docs.exists():
+        candidates.append(docs / app_name / "plotly_tmp")
+    candidates.append(home / f"{app_name}_plotly_tmp")
+    if is_windows():
+        dl = home / "Downloads"
+        if dl.exists():
+            candidates.insert(0, dl / app_name / "plotly_tmp")
+    for d in candidates:
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            return d
+        except Exception:
+            pass
+
+    d = Path(tempfile.gettempdir()) / f"{app_name.lower()}_plotly_tmp"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 def load_settings() -> dict:
     sp = settings_path()
@@ -241,8 +669,66 @@ def save_settings(data: dict) -> None:
     try:
         sp.write_text(json.dumps(data, indent=2), encoding="utf-8")
     except Exception:
-        # Best-effort only; do not crash the app.
+
         pass
+
+
+DEFAULT_TRHO_OUTPUT_NAMES = ["trho.out", "trho.outp"]
+DEFAULT_TLAP_OUTPUT_NAMES = ["tlap.out", "tlap.outp"]
+DEFAULT_ATBP_OUTPUT_NAMES = ["atbp.out", "atbp.outp"]
+
+
+def _sanitize_output_name_token(token: str) -> str:
+    s = str(token or "").strip()
+    s = s.replace("\\", "/").split("/")[-1]
+    return s
+
+
+def parse_output_name_list(raw, default_names: List[str]) -> List[str]:
+    """Parse configurable output file names from settings/UI.
+
+    Accepted input:
+      - list/tuple of names
+      - semicolon/comma/newline separated string
+    """
+    if isinstance(raw, (list, tuple)):
+        seq = list(raw)
+    else:
+        txt = str(raw or "")
+        seq = re.split(r"[;,\n]+", txt)
+
+    out = []
+    seen = set()
+    for item in seq:
+        name = _sanitize_output_name_token(item)
+        if not name:
+            continue
+        low = name.lower()
+        if low in seen:
+            continue
+        seen.add(low)
+        out.append(name)
+
+    if out:
+        return out
+
+    defaults = []
+    seen = set()
+    for item in (default_names or []):
+        name = _sanitize_output_name_token(item)
+        if not name:
+            continue
+        low = name.lower()
+        if low in seen:
+            continue
+        seen.add(low)
+        defaults.append(name)
+    return defaults
+
+
+def format_output_name_list(names, default_names: List[str]) -> str:
+    vals = parse_output_name_list(names, default_names)
+    return "; ".join(vals)
 
 def resolve_executable(exe: str | os.PathLike | None) -> Optional[Path]:
     """Resolve an executable that may be an absolute path or a command in PATH."""
@@ -251,17 +737,359 @@ def resolve_executable(exe: str | os.PathLike | None) -> Optional[Path]:
     s = str(exe).strip()
     if not s:
         return None
-    pth = Path(s)
+    pth = Path(s).expanduser()
     if pth.is_file():
-        return pth
+        return pth.resolve()
     w = shutil.which(s)
-    return Path(w) if w else None
+    return Path(w).resolve() if w else None
 
-# Sidebar button sizing (ttk uses Style for font; width is in text units)
-SIDEBAR_BTN_WIDTH = 18
 
-# Minimal infrastructure helpers (engine-stable)
-# ----------------------------
+def validate_properties_executable(exe: str | os.PathLike | None, *, timeout: float = 2.0) -> tuple[bool, str, str, Optional[Path]]:
+    """Validate the CRYSTAL/TOPOND properties executable selected by the user.
+
+    The previous Settings test only checked whether a file existed.  That allowed
+    a text file named 'properties' to be accepted and the calculation failed later
+    with an uninformative TRHO/TLAP/ATBP error.  This helper performs a stricter
+    check: path resolution, regular-file check, execute-permission check on
+    Unix-like systems, and a short launch probe.  A timeout during the launch
+    probe is considered acceptable, because some valid console executables may
+    wait for stdin or print a prompt.
+    """
+    raw = str(exe or '').strip()
+    if not raw:
+        return (
+            False,
+            'not_configured',
+            "The CRYSTAL/TOPOND properties executable is not configured.",
+            None,
+        )
+
+    resolved = resolve_executable(raw)
+    if resolved is None:
+        return (
+            False,
+            'not_found',
+            "The CRYSTAL/TOPOND properties executable could not be found.\n\n"
+            f"Current setting:\n{raw}",
+            None,
+        )
+
+    try:
+        if not resolved.is_file():
+            return (
+                False,
+                'not_file',
+                "The selected properties path exists, but it is not a regular file.\n\n"
+                f"Current setting:\n{resolved}",
+                resolved,
+            )
+    except Exception as e:
+        return (
+            False,
+            'stat_error',
+            "The selected properties executable could not be inspected.\n\n"
+            f"Current setting:\n{resolved}\n\nDetails: {e}",
+            resolved,
+        )
+
+    if (not is_windows()) and (not os.access(str(resolved), os.X_OK)):
+        return (
+            False,
+            'not_executable',
+            "The selected properties file exists, but it is not executable.\n\n"
+            f"Current setting:\n{resolved}\n\n"
+            "Please check the path in Settings or give execution permission to the properties executable.",
+            resolved,
+        )
+
+
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            [str(resolved)],
+            cwd=str(resolved.parent),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            **_windows_subprocess_silent_kwargs(),
+        )
+        try:
+            proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+                proc.communicate(timeout=1)
+            except Exception:
+                pass
+        return (True, 'ok', f"OK: {resolved}", resolved)
+    except PermissionError as e:
+        return (
+            False,
+            'permission_denied',
+            "The selected properties file could not be executed due to missing permission.\n\n"
+            f"Current setting:\n{resolved}\n\nDetails: {e}",
+            resolved,
+        )
+    except OSError as e:
+        return (
+            False,
+            'launch_failed',
+            "The selected file exists, but it could not be executed as a valid properties executable.\n\n"
+            f"Current setting:\n{resolved}\n\nDetails: {e}",
+            resolved,
+        )
+    except Exception as e:
+        return (
+            False,
+            'launch_failed',
+            "The selected properties executable could not be validated.\n\n"
+            f"Current setting:\n{resolved}\n\nDetails: {e}",
+            resolved,
+        )
+    finally:
+        try:
+            if proc is not None and proc.poll() is None:
+                proc.kill()
+        except Exception:
+            pass
+
+
+def detect_trho_output_issue(out_path: str | os.PathLike | Path, parsed: Optional["TrhoParsed"] = None) -> Optional[dict]:
+    """Detect fatal or suspicious TOPOND/TRHO output conditions.
+
+    Some TOPOND runs terminate cleanly at the OS level while printing a fatal
+    TOPOND-level message in trho.out.  In that situation the previous GUI logic
+    could report "TRHO completed" and, if all counters were zero, even show a
+    misleading Morse balance.  This helper centralizes known fatal-message
+    checks and a conservative zero-result sanity check.
+    """
+    path = Path(out_path).expanduser()
+    try:
+        txt = path.read_text(encoding="utf-8", errors="ignore")
+    except Exception as e:
+        return {
+            "kind": "output_read_error",
+            "title": "TRHO output could not be inspected",
+            "message": f"TRHO output could not be inspected before parsing.\n\nFile: {path}\nDetails: {e}",
+        }
+
+    up = txt.upper()
+    known = [
+        (
+            "NO F-FUNCTIONS IN TOPOND",
+            "f_functions",
+            "TOPOND does not support f-functions for this analysis.",
+            "TOPOND stopped because the basis set contains f-functions.\n\n"
+            "Current TOPOND routines do not support f-functions for this TRHO analysis.\n"
+            "Please rerun the CRYSTAL calculation using a basis set without f-functions "
+            "(for example, limited to s, p and d functions).",
+        ),
+    ]
+    for token, kind, title, msg in known:
+        if token in up:
+            return {"kind": kind, "title": title, "message": msg, "token": token}
+
+    if parsed is not None:
+        try:
+            ntrue = len(getattr(parsed, "df_true_atoms", []))
+        except Exception:
+            ntrue = 0
+        try:
+            nbcp = len(getattr(parsed, "df_bcp_props", []))
+        except Exception:
+            nbcp = 0
+        try:
+            nrcp = len(getattr(parsed, "df_ring", []))
+        except Exception:
+            nrcp = 0
+        try:
+            nccp = len(getattr(parsed, "df_cage", []))
+        except Exception:
+            nccp = 0
+        if ntrue == 0 and nbcp == 0 and nrcp == 0 and nccp == 0:
+            return {
+                "kind": "empty_topology",
+                "title": "TRHO produced no parsed topological data.",
+                "message": (
+                    "TRHO output was parsed, but no TRUE atoms or critical points were found.\n\n"
+                    "This usually indicates that TOPOND stopped before completing the TRHO search, "
+                    "or that the output is not a valid/complete TRHO result.\n\n"
+                    "One common cause is the presence of f-functions in the basis set, "
+                    "which may lead TOPOND/properties to stop with a message such as:\n\n"
+                    "NO F-FUNCTIONS IN TOPOND\n\n"
+                    "Please inspect trho.out and, if this message is present, rerun the calculation "
+                    "after correcting the underlying TOPOND issue."
+                ),
+            }
+    return None
+
+def get_default_properties_candidates() -> List[str | Path]:
+    """Return OS-specific candidates for the CRYSTAL/TOPOND properties executable."""
+    candidates: List[str | Path] = []
+
+    if is_windows():
+        env_keys = ("CRYSPROP_PROPERTIES", "TOPISO3D_PROPERTIES", "PROPERTIES_EXE")
+        for key in env_keys:
+            val = os.environ.get(key)
+            if val:
+                candidates.append(val)
+        candidates.extend([
+            "properties.exe",
+            "properties",
+        ])
+        return candidates
+
+    if is_macos():
+        env_keys = ("CRYSPROP_PROPERTIES", "TOPISO3D_PROPERTIES", "PROPERTIES_EXE")
+        for key in env_keys:
+            val = os.environ.get(key)
+            if val:
+                candidates.append(val)
+        candidates.extend([
+            "properties",
+            "/Applications/CRYSTAL/properties",
+        ])
+        return candidates
+
+    env_keys = ("CRYSPROP_PROPERTIES", "TOPISO3D_PROPERTIES", "PROPERTIES_EXE")
+    for key in env_keys:
+        val = os.environ.get(key)
+        if val:
+            candidates.append(val)
+    candidates.extend([
+        Path("/usr/crysprop/CRYSTAL_f_orb/properties"),
+        "properties",
+    ])
+    return candidates
+
+def resolve_default_properties_executable() -> Path:
+    """Resolve the best default properties executable for the current platform."""
+    for cand in get_default_properties_candidates():
+        resolved = resolve_executable(cand)
+        if resolved is not None:
+            return resolved
+    return Path("properties.exe" if is_windows() else "properties")
+
+def safe_symlink_or_copy(src: Path, dst: Path) -> Tuple[bool, str]:
+    """Prepare dst from src, preferring a symlink and falling back to a copy."""
+    src = Path(src).expanduser().resolve()
+    dst = Path(dst).expanduser()
+
+    try:
+        if dst.exists() or dst.is_symlink():
+            dst.unlink()
+    except Exception:
+        pass
+
+    try:
+        target = src.name if src.parent.resolve() == dst.parent.resolve() else src
+        dst.symlink_to(target)
+        return True, f"created symlink {dst.name} -> {src.name}"
+    except Exception:
+        try:
+            shutil.copy2(src, dst)
+            return True, f"copied {src.name} -> {dst.name}"
+        except Exception as e:
+            return False, f"failed to prepare {dst.name} from {src.name}: {e}"
+
+
+def run_external_program(
+    exe: str | os.PathLike,
+    *,
+    cwd: str | os.PathLike,
+    stdin_path: str | os.PathLike | None = None,
+    stdout_path: str | os.PathLike | None = None,
+    line_callback: Optional[Callable[[str], None]] = None,
+    timeout: float | None = None,
+    encoding: str = "utf-8",
+) -> dict:
+    """Run an external program in a platform-robust way.
+
+    The program is launched without an intermediate shell, with stdout/stderr
+    merged and decoded using a tolerant text mode. Output can be streamed to a
+    callback and optionally mirrored to a file.
+    """
+    exe_path = resolve_executable(exe)
+    if exe_path is None:
+        raise FileNotFoundError(f"Executable not found: {exe!r}")
+
+    cwd_path = Path(cwd).expanduser().resolve()
+    stdin_file = None
+    stdout_file = None
+    process = None
+    start = time.time()
+    timed_out = False
+    cmd = [str(exe_path)]
+
+    try:
+        if stdin_path is not None:
+            stdin_file = open(Path(stdin_path).expanduser(), "r", encoding=encoding, errors="replace")
+        if stdout_path is not None:
+            stdout_file = open(Path(stdout_path).expanduser(), "w", encoding=encoding, errors="replace")
+
+        process = subprocess.Popen(
+            cmd,
+            cwd=str(cwd_path),
+            stdin=stdin_file,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding=encoding,
+            errors="replace",
+            bufsize=1,
+            **_windows_subprocess_silent_kwargs(),
+        )
+
+        assert process.stdout is not None
+        while True:
+            line = process.stdout.readline()
+            if line:
+                if line_callback is not None:
+                    line_callback(line.rstrip("\n"))
+                if stdout_file is not None:
+                    stdout_file.write(line)
+            elif process.poll() is not None:
+                break
+
+            if timeout is not None and (time.time() - start) > timeout:
+                timed_out = True
+                process.kill()
+                break
+
+        if timed_out and process.stdout is not None:
+            for line in process.stdout:
+                if line_callback is not None:
+                    line_callback(line.rstrip("\n"))
+                if stdout_file is not None:
+                    stdout_file.write(line)
+
+        exit_code = process.wait() if process is not None else -1
+    finally:
+        if stdout_file is not None:
+            stdout_file.flush()
+            stdout_file.close()
+        if stdin_file is not None:
+            stdin_file.close()
+
+    duration_s = float(time.time() - start)
+    return {
+        "command": cmd,
+        "cwd": str(cwd_path),
+        "exe_resolved": str(exe_path),
+        "exit_code": int(exit_code),
+        "duration_s": duration_s,
+        "timed_out": bool(timed_out),
+        "stdout_path": str(Path(stdout_path).expanduser()) if stdout_path is not None else "",
+        "stdin_path": str(Path(stdin_path).expanduser()) if stdin_path is not None else "",
+    }
+
+
+SIDEBAR_BTN_WIDTH = 15
+
+
 def _ws_dir(ctx: "ProjectContext") -> Optional[Path]:
     return ctx.workspace_dir
 
@@ -318,7 +1146,7 @@ def log_event(ctx: "ProjectContext", message: str) -> None:
         with lp.open("a", encoding="utf-8") as f:
             f.write(f"[{ts}] {message}\n")
 
-        # Trim if too large (best-effort)
+
         maxb = int(getattr(ctx, "max_log_bytes", 0) or 0)
         keepb = int(getattr(ctx, "keep_log_bytes", 0) or 0)
         if maxb > 0 and lp.exists():
@@ -333,9 +1161,8 @@ def log_event(ctx: "ProjectContext", message: str) -> None:
             except Exception:
                 pass
     except Exception:
-        # Logging must never break the GUI.
-        pass
 
+        pass
 
 
 def _labeled_entry(parent, label, var: tk.StringVar, width: int = 10) -> ttk.Frame:
@@ -353,9 +1180,9 @@ def _labeled_entry(parent, label, var: tk.StringVar, width: int = 10) -> ttk.Fra
     lbl.pack(side="left")
     ent = ttk.Entry(frm, textvariable=var, width=width)
     ent.pack(side="left", padx=(6, 0))
-    # attach handles for UX toggling
-    frm._lbl = lbl  # type: ignore[attr-defined]
-    frm._ent = ent  # type: ignore[attr-defined]
+
+    frm._lbl = lbl
+    frm._ent = ent
     return frm
 
 
@@ -374,58 +1201,138 @@ def _set_labeled_state(frm: ttk.Frame, enabled: bool) -> None:
         except Exception:
             pass
     try:
-        # ttk labels support foreground; if a theme ignores it, it's still harmless.
+
         lbl.configure(foreground=("black" if enabled else "#666666"))
     except Exception:
         pass
 
 
+def _bind_vertical_mousewheel(widget: tk.Misc, canvas: tk.Canvas) -> None:
+    """Best-effort mousewheel binding for scrollable Tk canvases across platforms."""
+    def _on_mousewheel(event):
+        try:
+            if getattr(event, 'num', None) == 4:
+                canvas.yview_scroll(-1, 'units')
+                return 'break'
+            if getattr(event, 'num', None) == 5:
+                canvas.yview_scroll(1, 'units')
+                return 'break'
+            delta = int(getattr(event, 'delta', 0) or 0)
+            if delta == 0:
+                return None
+            if is_windows():
+                steps = -int(delta / 120) if delta else 0
+            else:
+                steps = -1 if delta > 0 else 1
+            if steps:
+                canvas.yview_scroll(steps, 'units')
+                return 'break'
+        except Exception:
+            return None
+        return None
+
+    for seq in ('<MouseWheel>', '<Shift-MouseWheel>', '<Button-4>', '<Button-5>'):
+        try:
+            widget.bind(seq, _on_mousewheel, add=True)
+        except Exception:
+            pass
 
 
-# -----------------------------
-# UI Theme (v2-like palette)
-# -----------------------------
-UI_BG_MAIN = "#999999"      # main window background
-UI_BG_DARK = "#4F4F4F"      # dark header background
-UI_BG_FIELD = "#cccccc"     # entry/list background
-UI_BG_PANEL = "#D3D3D3"     # light panel background
-UI_ACCENT = "#E6BA00"       # yellow accent
+def _make_scrollable_frame(parent: tk.Misc, *, canvas_bg: str | None = None) -> tuple[ttk.Frame, tk.Canvas, ttk.Scrollbar, ttk.Frame]:
+    """Create a vertical scroll container and return (outer, canvas, scrollbar, inner)."""
+    if canvas_bg is None:
+        try:
+            canvas_bg = str(ttk.Style().lookup("TFrame", "background") or "").strip()
+        except Exception:
+            canvas_bg = ""
+        if not canvas_bg:
+            try:
+                canvas_bg = str(parent.winfo_toplevel().cget("bg") or "").strip()
+            except Exception:
+                canvas_bg = ""
+        if not canvas_bg:
+            canvas_bg = "#999999"
+
+    outer = ttk.Frame(parent, style="Content.TFrame")
+    canvas = tk.Canvas(outer, bg=canvas_bg, highlightthickness=0, bd=0)
+    vbar = ttk.Scrollbar(outer, orient='vertical', command=canvas.yview)
+    canvas.configure(yscrollcommand=vbar.set)
+
+    canvas.grid(row=0, column=0, sticky='nsew')
+    vbar.grid(row=0, column=1, sticky='ns')
+    outer.rowconfigure(0, weight=1)
+    outer.columnconfigure(0, weight=1)
+
+    inner = ttk.Frame(canvas, style="Content.TFrame")
+    window_id = canvas.create_window((0, 0), window=inner, anchor='nw')
+
+    def _sync_scrollregion(_event=None):
+        try:
+            canvas.configure(scrollregion=canvas.bbox('all'))
+        except Exception:
+            pass
+
+    def _sync_inner_width(event=None):
+        try:
+            width = max(1, canvas.winfo_width())
+            canvas.itemconfigure(window_id, width=width)
+        except Exception:
+            pass
+
+    inner.bind('<Configure>', _sync_scrollregion, add=True)
+    canvas.bind('<Configure>', _sync_inner_width, add=True)
+    _bind_vertical_mousewheel(canvas, canvas)
+    _bind_vertical_mousewheel(inner, canvas)
+
+    try:
+        canvas.configure(takefocus=0)
+    except Exception:
+        pass
+
+    return outer, canvas, vbar, inner
+
+
+UI_BG_MAIN = "#999999"
+UI_BG_DARK = "#4F4F4F"
+UI_BG_FIELD = "#cccccc"
+UI_BG_PANEL = "#D3D3D3"
+UI_ACCENT = "#E6BA00"
 UI_FG_MAIN = "black"
 UI_FG_MUTED = UI_BG_DARK
 
-# -----------------------------
-# Atomic-number normalization
-# -----------------------------
-# CRYSTAL/TOPOND may print pseudopotential-coded atomic numbers such as 241 for Nb.
-# For visualization and labels we normalize them to the corresponding chemical Z.
-_PSEUDO_Z_MAP = {
-    241: 41,  # Nb
-}
 
 def normalize_atomic_number(z):
     try:
         zi = int(float(z))
     except Exception:
         return z
-    return _PSEUDO_Z_MAP.get(zi, zi)
+    if zi >= 200:
+        rem = zi % 100
+        if 1 <= rem <= 118:
+            return rem
+    return zi
 
 
-# -----------------------------
-# State (ProjectContext)
-# -----------------------------
 @dataclass
 class ProjectContext:
     workspace_dir: Optional[Path] = None
 
-    # Auto-detected
+
     has_fort9: bool = False
     f9_candidates: List[Path] = field(default_factory=list)
     can_write: bool = False
+
+
     workspace_ok: bool = False
+
+    workspace_compute_ok: bool = False
+
+    workspace_import_only: bool = False
+    has_existing_trho: bool = False
     workspace_msg: str = "—"
     properties_exe: Optional[Path] = None
 
-    # Job state
+
     trho_done: bool = False
     status: str = "Ready."
     active_trho_run: Optional[Path] = None
@@ -440,9 +1347,10 @@ class ProjectContext:
     tlap_simple_preset: str = "relaxed"
     tlap_adv_iauto: str = "0"
 
-    # Parsed TRHO/TLAP (filled after successful parse)
+
     trho_parsed: Optional["TrhoParsed"] = None
     trho_parse_attempted_out: str = ""
+    trho_output_issue: Optional[dict] = None
     tlap_parsed: Optional["TlapParsed"] = None
     tlap_done: bool = False
     tlap_parse_error: Optional[str] = None
@@ -453,27 +1361,26 @@ class ProjectContext:
     pending_trho_run_name: str = ""
     pending_tlap_run_name: str = ""
 
-    # PL2D state
+
     pl2d_cfg: Optional[dict] = None
     pl2d_signature: Optional[str] = None
     pl2d_run_dir: Optional[Path] = None
 
 
-    pl2d_running: bool = False  # True while PL2D loop is running
+    pl2d_running: bool = False
 
-    # Logging controls (topiso3d.log)
+
     enable_log: bool = True
-    max_log_bytes: int = 512_000          # ~500 KB
-    keep_log_bytes: int = 200_000         # keep last ~200 KB when trimming
+    max_log_bytes: int = 512_000
+    keep_log_bytes: int = 200_000
     delete_log_on_trho_success: bool = False
-    cleanup_policy: str = "minimal"  # one of: minimal, standard, none
+    cleanup_policy: str = "minimal"
 
     def __post_init__(self):
         if self.f9_candidates is None:
             self.f9_candidates = []
 
 
-    # Backward-compatible alias: some code expects ctx.workspace_dir
     @property
     def workspace(self) -> Optional[Path]:
         return self.workspace_dir
@@ -482,9 +1389,6 @@ class ProjectContext:
     def workspace(self, value: Optional[Path]):
         self.workspace_dir = value
 
-# -----------------------------
-# Parsed results (TRHO)
-# -----------------------------
 
 @dataclass
 class TrhoParsed:
@@ -494,30 +1398,29 @@ class TrhoParsed:
     and we avoid globals by storing everything inside this object / context.
     """
 
-    str_type: str  # "Crystal" or "Molecule"
+    str_type: str
     df_primitive: pd.DataFrame
     df_true_atoms: pd.DataFrame
     df_cpviewer_atoms: pd.DataFrame = field(default_factory=pd.DataFrame)
     df_cpviewer_pool_atoms: pd.DataFrame = field(default_factory=pd.DataFrame)
     cell_vectors_ang: np.ndarray = field(default_factory=lambda: np.zeros((0, 3), dtype=float))
 
-    # Minimal CP coordinate tables (Angstrom)
+
     df_bcp_coords: pd.DataFrame = field(default_factory=pd.DataFrame)
     df_attr: pd.DataFrame = field(default_factory=pd.DataFrame)
     df_ring: pd.DataFrame = field(default_factory=pd.DataFrame)
     df_cage: pd.DataFrame = field(default_factory=pd.DataFrame)
 
-    # Verbose / property tables
+
     df_bcp_props: pd.DataFrame = field(default_factory=pd.DataFrame)
     df_rcp_props: pd.DataFrame = field(default_factory=pd.DataFrame)
     df_ccp_props: pd.DataFrame = field(default_factory=pd.DataFrame)
 
-    # Optional: non-nuclear attractors (can be empty)
+
     df_att_nao_nucl: pd.DataFrame = field(default_factory=pd.DataFrame)
     nna_count: int = 0
     nna_messages: List[str] = field(default_factory=list)
     nna_cutoff_ang: float = 0.350
-
 
 
 def _parse_direct_lattice_vectors_ang(lines: List[str]) -> np.ndarray:
@@ -554,7 +1457,7 @@ def parse_trho_out(
     bohr_to_ang: float = 0.5291772083,
     open_shell: bool = False,
     slab_2d: bool = False,
-    # parâmetros geométricos para mapear coordenadas -> "pt_*" (só se você quiser já aqui)
+
     xmi: float | None = None,
     xma: float | None = None,
     ymi: float | None = None,
@@ -575,11 +1478,7 @@ def parse_trho_out(
     txt = out_path.read_text(errors="ignore").splitlines()
     cell_vectors_ang = _parse_direct_lattice_vectors_ang(txt)
 
-    # --- possible non-nuclear attractors (NNAs) explicitly flagged by TOPOND ---
-    # Count *occurrences*, not unique message strings. Some TOPOND outputs repeat the
-    # same warning text for multiple CPs, and de-duplicating would undercount NNAs.
-    # We count the canonical warning phrase in the full text first; if absent, fall back
-    # to a line-based scan for broader compatibility with minor output variations.
+
     raw_text = "\n".join(txt)
     canonical_pat = re.compile(
         r"THE\s*\(3,\s*-3\)\s*ATTRACTOR\s+IS\s+PROBABLY\s+A\s+NON-NUCLEAR\s+ATTRACTOR",
@@ -590,7 +1489,7 @@ def parse_trho_out(
 
     nna_messages: List[str] = []
     if nna_count > 0:
-        # Preserve one short message per detected occurrence for optional downstream use.
+
         nna_messages = [
             "THE (3,-3) ATTRACTOR IS PROBABLY A NON-NUCLEAR ATTRACTOR"
             for _ in canonical_matches
@@ -603,7 +1502,7 @@ def parse_trho_out(
                 if s:
                     nna_messages.append(s)
         nna_count = len(nna_messages)
-    # ---- robust token helpers (output format varies between PROPERTIES versions) ----
+
     _re_float = re.compile(r"[-+]?\d*\.?\d+(?:[Ee][-+]?\d+)?")
     _re_int = re.compile(r"\b\d+\b")
 
@@ -625,25 +1524,24 @@ def parse_trho_out(
         return []
 
 
-    # --- detect crystal vs molecule ---
     str_type = "Molecule"
     if any("DIRECT LATTICE" in ln for ln in txt):
         str_type = "Crystal"
 
-    # --- number of atoms per cell ---
+
     num_atom = None
     for ln in txt:
         if "N. OF ATOMS PER CELL" in ln:
             parts = ln.split()
-            # no seu código era parts[5]
+
             try:
                 num_atom = int(parts[5])
             except Exception:
                 pass
             break
     if num_atom is None:
-        # Try a more tolerant detection (CRYSTAL output varies between versions).
-        # We look for any line mentioning atoms per cell and grab the last integer in it.
+
+
         import re as _re
         for ln in txt:
             if ("ATOMS PER CELL" in ln) or ("N. OF ATOMS" in ln):
@@ -655,15 +1553,15 @@ def parse_trho_out(
                     except Exception:
                         pass
         if num_atom is None:
-            # Do not hard-fail: keep parsing what we can.
+
             num_atom = 0
 
-    # --- TRUE atoms list ---
+
     atom_true = []
     for ln in txt:
         if "IN THE UNIT CELL" in ln:
             parts = ln.split()
-            # seu if len(parts[3]) > 1 etc. (mantive a mesma heurística)
+
             if len(parts) >= 6:
                 if len(parts[3]) > 1:
                     atom_true.append(int(parts[4]))
@@ -672,8 +1570,7 @@ def parse_trho_out(
 
     atom_true_set = set(atom_true)
 
-    # --- primitive atoms coordinates block ---
-    # encontra linha "ATOM  SHEL    X(AU) ..."
+
     i0 = None
     for i, ln in enumerate(txt):
         if "ATOM  SHEL" in ln and "X(AU)" in ln and "Y(AU)" in ln and "Z(AU)" in ln:
@@ -682,9 +1579,8 @@ def parse_trho_out(
 
     rows = []
     if i0 is not None and num_atom > 0:
-        # no output do CRYSTAL/PROPERTIES, a tabela vem assim (exemplo):
-        #  12 MG   3     0.000     0.000     0.000
-        #   8 O    3     3.978     3.978     3.978
+
+
         start = i0 + 2
         for k in range(num_atom):
             if start + k >= len(txt):
@@ -693,9 +1589,7 @@ def parse_trho_out(
             if not parts:
                 continue
 
-            # formatos possíveis:
-            # A) Z SYM SHEL X Y Z   (mais comum)
-            # B) Z SHEL X Y Z       (mais raro)
+
             try:
                 z = int(parts[0])
             except Exception:
@@ -703,7 +1597,7 @@ def parse_trho_out(
 
             sym = ""
             if len(parts) >= 6 and parts[1].isalpha():
-                # A)
+
                 try:
                     sym = str(parts[1]).strip().capitalize()
                     shel = int(parts[2])
@@ -711,7 +1605,7 @@ def parse_trho_out(
                 except Exception:
                     continue
             elif len(parts) >= 5:
-                # B)
+
                 try:
                     shel = int(parts[1])
                     x = float(parts[2]); y = float(parts[3]); zc = float(parts[4])
@@ -731,7 +1625,7 @@ def parse_trho_out(
     df_primitive = pd.DataFrame(rows, columns=["ELEMENT", "ELEMENT_RAW", "SYMBOL", "x_BOHR", "y_BOHR", "z_BOHR"])
     df_primitive.index = np.arange(1, len(df_primitive) + 1)
 
-    # TRUE atoms: se o bloco "IN THE UNIT CELL" não existir, considera todos como TRUE
+
     if len(atom_true_set) == 0:
         df_primitive["TRUE"] = 1
     else:
@@ -744,9 +1638,7 @@ def parse_trho_out(
     df_true_atoms = df_primitive[df_primitive["TRUE"] == 1].copy()
     df_true_atoms = df_true_atoms.drop(columns=["x_BOHR", "y_BOHR", "z_BOHR", "TRUE"])
 
-    # --- CP counts (robusto: tenta bloco verboso "CP TYPE" e também a tabela compacta)
-    # Verboso (linhas "CP TYPE ...")
-    # Match CP TYPE lines robustly (allow spaces like '(3, +1)')
+
     re_bcp = re.compile(r"\(3,\s*-1\)")
     re_attr = re.compile(r"\(3,\s*-3\)")
     re_rcp = re.compile(r"\(3,\s*\+1\)")
@@ -757,9 +1649,7 @@ def parse_trho_out(
     cont_rcp_verbose = sum(1 for ln in txt if "CP TYPE" in ln and re_rcp.search(ln))
     cont_ccp_verbose = sum(1 for ln in txt if "CP TYPE" in ln and re_ccp.search(ln))
 
-    # Compacto (tabela "CRITICAL POINTS FOUND").
-    # Algumas versões do TOPOND inserem espaços no TYPE (ex.: "(3, -3)") e/ou usam
-    # notação científica, então o parser abaixo é propositalmente tolerante.
+
     compact_rows = []
     in_cp_table = False
     header_seen = False
@@ -806,7 +1696,7 @@ def parse_trho_out(
                     row["ELLIP"] = float(tail_floats[5])
                 compact_rows.append(row)
                 continue
-            # heurística de parada: uma linha longa de asteriscos depois da tabela ou fim do bloco
+
             if ln.strip().startswith("********") and compact_rows:
                 break
 
@@ -815,13 +1705,13 @@ def parse_trho_out(
     cont_rcp_compact = sum(1 for r in compact_rows if str(r.get("TYPE", "")).replace(" ", "") == "(3,+1)")
     cont_ccp_compact = sum(1 for r in compact_rows if str(r.get("TYPE", "")).replace(" ", "") == "(3,+3)")
 
-    # Usa o que existir (máximo entre verboso e compacto)
+
     cont_bcp = max(cont_bcp_verbose, cont_bcp_compact)
     cont_attr = max(cont_attr_verbose, cont_attr_compact)
     cont_rcp = max(cont_rcp_verbose, cont_rcp_compact)
     cont_ccp = max(cont_ccp_verbose, cont_ccp_compact)
 
-    # pré-alocar arrays
+
     rho   = np.zeros(cont_bcp)
     grho  = np.zeros(cont_bcp)
     lap   = np.zeros(cont_bcp)
@@ -853,12 +1743,14 @@ def parse_trho_out(
     rab_arr = np.full(cont_bcp, np.nan) if cont_bcp else np.array([])
     bpl_over_rab_arr = np.full(cont_bcp, np.nan) if cont_bcp else np.array([])
 
-    # --- RCP/CCP arrays ---
-    # Coordenadas (AU)
+
+    topond_bcp_cp_n = np.full(cont_bcp, np.nan) if cont_bcp else np.array([])
+
+
     xyz_ring = np.zeros((cont_rcp, 3)) if cont_rcp else np.zeros((0,3))
     xyz_cage = np.zeros((cont_ccp, 3)) if cont_ccp else np.zeros((0,3))
 
-    # Propriedades (tentamos bloco verboso; se não houver, caímos no fallback da tabela compacta)
+
     rho_ring  = np.full(cont_rcp, np.nan) if cont_rcp else np.array([])
     grho_ring = np.full(cont_rcp, np.nan) if cont_rcp else np.array([])
     lap_ring  = np.full(cont_rcp, np.nan) if cont_rcp else np.array([])
@@ -871,6 +1763,7 @@ def parse_trho_out(
     spin_ring = np.full(cont_rcp, np.nan) if (cont_rcp and open_shell) else None
     ellip_ring = np.full(cont_rcp, np.nan) if cont_rcp else np.array([])
     eig_ring   = np.full((cont_rcp, 3), np.nan) if cont_rcp else np.zeros((0,3))
+    topond_rcp_cp_n = np.full(cont_rcp, np.nan) if cont_rcp else np.array([])
 
     rho_cage  = np.full(cont_ccp, np.nan) if cont_ccp else np.array([])
     grho_cage = np.full(cont_ccp, np.nan) if cont_ccp else np.array([])
@@ -884,10 +1777,22 @@ def parse_trho_out(
     spin_cage = np.full(cont_ccp, np.nan) if (cont_ccp and open_shell) else None
     ellip_cage = np.full(cont_ccp, np.nan) if cont_ccp else np.array([])
     eig_cage   = np.full((cont_ccp, 3), np.nan) if cont_ccp else np.zeros((0,3))
+    topond_ccp_cp_n = np.full(cont_ccp, np.nan) if cont_ccp else np.array([])
 
-    # ---- helpers ----
+
+    rcp_cluster_atoms_full = [""] * cont_rcp
+    rcp_cluster_atoms_shown = [""] * cont_rcp
+    rcp_cluster_distances_full = [""] * cont_rcp
+    rcp_cluster_n_atoms = np.zeros(cont_rcp, dtype=int) if cont_rcp else np.array([], dtype=int)
+
+    ccp_cluster_atoms_full = [""] * cont_ccp
+    ccp_cluster_atoms_shown = [""] * cont_ccp
+    ccp_cluster_distances_full = [""] * cont_ccp
+    ccp_cluster_n_atoms = np.zeros(cont_ccp, dtype=int) if cont_ccp else np.array([], dtype=int)
+
+
     def atom_symbol(z: int) -> str:
-        # ajuste se você já tiver uma tabela melhor no seu projeto
+
         try:
             z = int(normalize_atomic_number(z))
         except Exception:
@@ -903,7 +1808,74 @@ def parse_trho_out(
         }
         return periodic.get(z, f"Z{z}")
 
-    # ---- parse BCP section by scanning CP TYPE blocks ----
+    def _cp_number_before(line_index: int):
+        """Return the original TOPOND CP N. immediately preceding a CP TYPE line."""
+        try:
+            for jj in range(int(line_index), max(-1, int(line_index) - 12), -1):
+                m = re.search(r"CP\s+N\.\s*(\d+)", txt[jj], re.IGNORECASE)
+                if m:
+                    return int(m.group(1))
+        except Exception:
+            pass
+        return np.nan
+
+    def _cp_cluster_after(line_index: int, *, max_scan: int = 120, max_shown: int = 6) -> dict:
+        """Parse TOPOND's local "CLUSTER OF ATOMS AROUND THE CP" after a CP block.
+
+        The number of atoms printed in this section depends on the TOPOND input.
+        TopIso3D therefore preserves the full list for exports and creates a compact
+        display list (up to max_shown atoms plus "...") for GUI tables.
+        """
+        atoms: List[str] = []
+        distances: List[float] = []
+        try:
+            search_end = min(int(line_index) + int(max_scan), len(txt))
+            kk = int(line_index) + 1
+            while kk < search_end and "CLUSTER OF ATOMS AROUND THE CP" not in txt[kk]:
+
+                if kk > int(line_index) + 3 and "CP TYPE" in txt[kk].upper():
+                    break
+                kk += 1
+            if kk >= search_end or "CLUSTER OF ATOMS AROUND THE CP" not in txt[kk]:
+                return {"full": "", "shown": "", "distances": "", "n": 0}
+
+            ll = kk + 1
+            while ll < search_end:
+                line = txt[ll]
+                parts = line.split()
+
+
+                if len(parts) >= 10 and parts[0].isdigit() and parts[1].isdigit() and parts[5].isdigit():
+                    try:
+                        old_id = int(parts[1])
+                        znum = int(parts[5])
+                        atoms.append(f"{atom_symbol(znum)}-{old_id}")
+                        distances.append(float(parts[-1]))
+                    except Exception:
+                        pass
+                elif atoms:
+
+                    if (not line.strip()) or line.strip().startswith("CP N.") or line.strip().startswith("********") or "CP TYPE" in line.upper():
+                        break
+                ll += 1
+
+        except Exception:
+            atoms = []
+            distances = []
+
+        n_atoms = len(atoms)
+        shown_atoms = atoms[:max_shown]
+        shown = ", ".join(shown_atoms)
+        if n_atoms > max_shown:
+            shown += ", ..."
+        return {
+            "full": ", ".join(atoms),
+            "shown": shown,
+            "distances": ", ".join(f"{d:.3f}" for d in distances),
+            "n": n_atoms,
+        }
+
+
     b = 0
     r = 0
     c = 0
@@ -913,14 +1885,15 @@ def parse_trho_out(
             continue
 
         if "(3,-1)" in ln:
-            # Robust parse: output format can vary; prefer extracting trailing floats/ints rather than fixed columns.
+
             try:
+                topond_bcp_cp_n[b] = _cp_number_before(i)
                 coord_vals = _last_n(_floats(txt[i + 1]), 3)
                 if len(coord_vals) != 3:
                     raise ValueError("Could not parse BCP coordinates")
                 xyz_bcp[b, :] = coord_vals
 
-                # If crystal, there is often a FRACT line after COORD; skip it.
+
                 j = i + 2
                 if str_type == "Crystal":
                     j += 1
@@ -958,8 +1931,7 @@ def parse_trho_out(
                         elfb[b] = vals[0]
                     j += 1
 
-                # eigenvalues line is further down; try to locate within a small window
-                # rather than relying on fixed offsets.
+
                 eig_set = False
                 for jj in range(j, min(j + 20, len(txt))):
                     fl = _floats(txt[jj])
@@ -971,7 +1943,7 @@ def parse_trho_out(
                             j = jj + 1
                             break
                 if not eig_set:
-                    # fallback: look for any line with >=3 floats later in the block
+
                     for jj in range(j, min(j + 25, len(txt))):
                         vals3 = _last_n(_floats(txt[jj]), 3)
                         if len(vals3) == 3:
@@ -979,7 +1951,7 @@ def parse_trho_out(
                             j = jj + 1
                             break
 
-                # ellipticity: look for a line containing "ELLIP" or at least one float
+
                 for jj in range(j, min(j + 25, len(txt))):
                     if "ELLIP" in txt[jj].upper() or "ELLIPT" in txt[jj].upper():
                         vals1 = _last_n(_floats(txt[jj]), 1)
@@ -992,11 +1964,7 @@ def parse_trho_out(
                     if len(vals1) == 1:
                         ellip[b] = vals1[0]
 
-                # Primary identification of the atoms connected by the BCP:
-                # use TOPOND's own "SEARCH OF BOND PATH ATTRACTORS" section.
-                # The local "CLUSTER OF ATOMS AROUND THE CP" is kept only as a fallback,
-                # because it lists atoms near the CP, not necessarily the two termini of
-                # the bond path.
+
                 try:
                     search_end = min(i + 240, len(txt))
                     kk = i + 1
@@ -1015,14 +1983,14 @@ def parse_trho_out(
                                 term_atom_id = np.nan
                                 term_dist = np.nan
                                 if len(coords_au) == 3:
-                                    # trajectory length for this terminus
+
                                     for mm in range(ll + 1, min(ll + 18, search_end)):
                                         if "TRAJECTORY LENGTH" in txt[mm].upper():
                                             vals1 = _last_n(_floats(txt[mm]), 1)
                                             if len(vals1) == 1:
                                                 traj_len = vals1[0]
                                             break
-                                    # nearest atom at the path terminus: first row in the terminus cluster
+
                                     term_hdr = ll
                                     while term_hdr < search_end and "CLUSTER OF ATOMS AROUND THE TERMINUS OF THE PATH" not in txt[term_hdr]:
                                         term_hdr += 1
@@ -1047,9 +2015,8 @@ def parse_trho_out(
                                         "coord_ang": [c * bohr_to_ang for c in coords_au],
                                         "atom": term_atom or "",
                                         "atom_id": term_atom_id,
-                                        # For the BCP report, DIST_ELEM*_ANG should be the
-                                        # distance from the BCP to each bond-path attractor,
-                                        # i.e. the trajectory length of that half-path.
+
+
                                         "dist": traj_len if np.isfinite(traj_len) else term_dist,
                                         "traj_len": traj_len,
                                     })
@@ -1070,7 +2037,7 @@ def parse_trho_out(
                             attr2_x_ang[b], attr2_y_ang[b], attr2_z_ang[b] = attr_info[1]["coord_ang"]
                             attr2_traj_len[b] = attr_info[1]["traj_len"]
 
-                        # Bond-path summary line printed by TOPOND for this BCP.
+
                         for mm in range(kk, search_end):
                             if "BPL (ANG)" in txt[mm].upper() and "RAB" in txt[mm].upper():
                                 vals3 = _last_n(_floats(txt[mm]), 3)
@@ -1078,7 +2045,7 @@ def parse_trho_out(
                                     bpl_arr[b], rab_arr[b], bpl_over_rab_arr[b] = vals3
                                 break
 
-                    # Fallback only if attractor parsing failed/incomplete.
+
                     if not neigh1[b] or not neigh2[b]:
                         found_neighbors = []
                         kk = i + 1
@@ -1090,8 +2057,8 @@ def parse_trho_out(
                             while ll < search_end and len(found_neighbors) < 2:
                                 line = txt[ll]
                                 parts = line.split()
-                                # Typical format:
-                                # NEW OLD CELLx CELLY CELLZ AT.NU X(AU) Y(AU) Z(AU) DISTANCE(ANG)
+
+
                                 if len(parts) >= 10 and parts[0].isdigit() and parts[1].isdigit() and parts[5].isdigit():
                                     try:
                                         old_id = int(parts[1])
@@ -1119,22 +2086,31 @@ def parse_trho_out(
 
                 b += 1
             except Exception:
-                # Skip this CP block if parsing fails (do not abort whole TRHO parsing).
+
                 continue
 
         elif re_rcp.search(ln) and cont_rcp:
-            # COORD (AU)
+
+            topond_rcp_cp_n[r] = _cp_number_before(i)
+            try:
+                _cluster = _cp_cluster_after(i)
+                rcp_cluster_atoms_full[r] = _cluster.get("full", "")
+                rcp_cluster_atoms_shown[r] = _cluster.get("shown", "")
+                rcp_cluster_distances_full[r] = _cluster.get("distances", "")
+                rcp_cluster_n_atoms[r] = int(_cluster.get("n", 0) or 0)
+            except Exception:
+                pass
             coord_vals = _last_n(_floats(txt[i + 1]), 3)
             if len(coord_vals) != 3:
                 continue
             coord = coord_vals
             xyz_ring[r, :] = coord
 
-            # tenta ler propriedades no mesmo padrão do BCP (quando o bloco verboso existir)
+
             try:
                 j = i + 2
                 if str_type == "Crystal":
-                    j += 1  # pula FRACT
+                    j += 1
 
                 props = txt[j].split()
                 props = [float(x) for x in props[3:6]]
@@ -1165,25 +2141,34 @@ def parse_trho_out(
                     elfb_ring[r] = float(eln2[2])
                     j += 1
 
-                # eigenvalues
+
                 j += 3
                 e = txt[j].split()
                 eig_ring[r, 0] = float(e[5])
                 eig_ring[r, 1] = float(e[6])
                 eig_ring[r, 2] = float(e[7])
 
-                # ellipticity
+
                 j += 5
                 ell = txt[j].split()
                 ellip_ring[r] = float(ell[2])
             except Exception:
-                # se falhar, mantém NaN e será preenchido pelo fallback (tabela compacta), se disponível
+
                 pass
 
             r += 1
 
         elif re_ccp.search(ln) and cont_ccp:
-            # COORD (AU)
+
+            topond_ccp_cp_n[c] = _cp_number_before(i)
+            try:
+                _cluster = _cp_cluster_after(i)
+                ccp_cluster_atoms_full[c] = _cluster.get("full", "")
+                ccp_cluster_atoms_shown[c] = _cluster.get("shown", "")
+                ccp_cluster_distances_full[c] = _cluster.get("distances", "")
+                ccp_cluster_n_atoms[c] = int(_cluster.get("n", 0) or 0)
+            except Exception:
+                pass
             coord_vals = _last_n(_floats(txt[i + 1]), 3)
             if len(coord_vals) != 3:
                 continue
@@ -1193,7 +2178,7 @@ def parse_trho_out(
             try:
                 j = i + 2
                 if str_type == "Crystal":
-                    j += 1  # pula FRACT
+                    j += 1
 
                 props = txt[j].split()
                 props = [float(x) for x in props[3:6]]
@@ -1238,12 +2223,12 @@ def parse_trho_out(
 
             c += 1
 
-    # fallback: se não achou (3,+1)/(3,+3) no bloco verboso, mas existem na tabela compacta,
-    # usa as coordenadas em Å e converte para AU.
+
     if cont_rcp and r == 0:
         ring_rows = [rr for rr in compact_rows if rr["TYPE"].replace(" ", "") == "(3,+1)"]
         if ring_rows:
             for k, rr in enumerate(ring_rows[:cont_rcp]):
+                topond_rcp_cp_n[k] = rr.get("CP_N", np.nan)
                 xyz_ring[k, 0] = rr["X_ANG"] / bohr_to_ang
                 xyz_ring[k, 1] = rr["Y_ANG"] / bohr_to_ang
                 xyz_ring[k, 2] = rr["Z_ANG"] / bohr_to_ang
@@ -1253,18 +2238,18 @@ def parse_trho_out(
         cage_rows = [rr for rr in compact_rows if rr["TYPE"].replace(" ", "") == "(3,+3)"]
         if cage_rows:
             for k, rr in enumerate(cage_rows[:cont_ccp]):
+                topond_ccp_cp_n[k] = rr.get("CP_N", np.nan)
                 xyz_cage[k, 0] = rr["X_ANG"] / bohr_to_ang
                 xyz_cage[k, 1] = rr["Y_ANG"] / bohr_to_ang
                 xyz_cage[k, 2] = rr["Z_ANG"] / bohr_to_ang
             c = min(len(cage_rows), cont_ccp)
 
-    # --- fallback de PROPRIEDADES via tabela compacta (se não houve bloco verboso) ---
-    # (3,+1)
+
     if cont_rcp:
         ring_rows = [rr for rr in compact_rows if rr["TYPE"].replace(" ", "") == "(3,+1)"]
         if ring_rows:
             for k, rr in enumerate(ring_rows[:cont_rcp]):
-                # só preenche se ainda estiver NaN (isto preserva o verboso quando disponível)
+
                 if k < len(rho_ring) and (np.isnan(rho_ring[k]) if isinstance(rho_ring[k], float) else False):
                     rho_ring[k] = rr["RHO"]
                 if k < len(lap_ring) and (np.isnan(lap_ring[k]) if isinstance(lap_ring[k], float) else False):
@@ -1276,7 +2261,7 @@ def parse_trho_out(
                     if np.isnan(eig_ring[k,1]): eig_ring[k,1] = rr["L2"]
                     if np.isnan(eig_ring[k,2]): eig_ring[k,2] = rr["L3"]
 
-    # (3,+3)
+
     if cont_ccp:
         cage_rows = [rr for rr in compact_rows if rr["TYPE"].replace(" ", "") == "(3,+3)"]
         if cage_rows:
@@ -1293,19 +2278,24 @@ def parse_trho_out(
                     if np.isnan(eig_cage[k,2]): eig_cage[k,2] = rr["L3"]
 
 
-    # montar df coords (ainda em AU; você usava ANGSTROM no nome mas na prática era AU nessa fase)
     df_bcp = pd.DataFrame(xyz_bcp, columns=["x_AU", "y_AU", "z_AU"])
+    df_bcp["TOPOND_CP_N"] = topond_bcp_cp_n
     df_bcp["X_ANGSTROM"] = df_bcp["x_AU"] * bohr_to_ang
     df_bcp["Y_ANGSTROM"] = df_bcp["y_AU"] * bohr_to_ang
     df_bcp["Z_ANGSTROM"] = df_bcp["z_AU"] * bohr_to_ang
     df_bcp.index = np.arange(1, len(df_bcp) + 1)
+    try:
+        df_bcp["TOPOND_CP_N"] = pd.to_numeric(df_bcp["TOPOND_CP_N"], errors="coerce").round().astype("Int64")
+    except Exception:
+        pass
 
-    # propriedades derivadas
+
     with np.errstate(divide='ignore', invalid='ignore'):
         adim_ratio = np.where(np.abs(gkin) > 1e-12, np.abs(vir) / gkin, 0.0)
     bond_degree = (vir + gkin) / rho
 
     df_prop = pd.DataFrame({
+        "TOPOND_CP_N": topond_bcp_cp_n,
         "ELEM1": neigh1,
         "DIST_ELEM1_ANG": dist1,
         "ELEM2": neigh2,
@@ -1344,8 +2334,12 @@ def parse_trho_out(
         df_prop["ELFb"] = elfb
 
     df_prop.index = np.arange(1, len(df_prop) + 1)
+    try:
+        df_prop["TOPOND_CP_N"] = pd.to_numeric(df_prop["TOPOND_CP_N"], errors="coerce").round().astype("Int64")
+    except Exception:
+        pass
 
-    # add BCP_ELEM from the bond-path attractors (symbols only, without atom ids)
+
     def _bcp_elem_symbol(label: str) -> str:
         s = str(label or "").strip()
         m = re.match(r"([A-Za-z]{1,3})", s)
@@ -1355,15 +2349,16 @@ def parse_trho_out(
     b2 = [_bcp_elem_symbol(x) for x in df_prop["ELEM2"]]
     df_prop["BCP_ELEM"] = [f"{x}-{y}" if (x and y) else (x or y or "BCP") for x, y in zip(b1, b2)]
 
-    # junta coords
+
     df_bcp_props = pd.concat([df_prop, df_bcp[["X_ANGSTROM","Y_ANGSTROM","Z_ANGSTROM"]]], axis=1)
 
-    # rings/cages (coords + props)
+
     df_ring = pd.DataFrame(xyz_ring, columns=["x_AU","y_AU","z_AU"]) if cont_rcp else pd.DataFrame()
     df_cage = pd.DataFrame(xyz_cage, columns=["x_AU","y_AU","z_AU"]) if cont_ccp else pd.DataFrame()
 
-    # RCP props
+
     if cont_rcp:
+        df_ring["TOPOND_CP_N"] = topond_rcp_cp_n
         df_ring["X_ANGSTROM"] = df_ring["x_AU"] * bohr_to_ang
         df_ring["Y_ANGSTROM"] = df_ring["y_AU"] * bohr_to_ang
         df_ring["Z_ANGSTROM"] = df_ring["z_AU"] * bohr_to_ang
@@ -1374,6 +2369,11 @@ def parse_trho_out(
         bond_degree_ring = np.where(np.isfinite(rho_ring) & (rho_ring != 0), (vir_ring + gkin_ring) / rho_ring, np.nan)
 
         df_rcp_props = pd.DataFrame({
+            "TOPOND_CP_N": topond_rcp_cp_n,
+            "CP_ATOMS": rcp_cluster_atoms_shown,
+            "CP_CLUSTER_ATOMS": rcp_cluster_atoms_full,
+            "CP_CLUSTER_DISTANCES_ANG": rcp_cluster_distances_full,
+            "CP_CLUSTER_N_ATOMS": rcp_cluster_n_atoms,
             "RHO": rho_ring,
             "GRHO": grho_ring,
             "GKIN": gkin_ring,
@@ -1394,12 +2394,18 @@ def parse_trho_out(
             df_rcp_props["ELFb"] = elfb_ring
 
         df_rcp_props.index = np.arange(1, len(df_rcp_props) + 1)
+        try:
+            df_rcp_props["TOPOND_CP_N"] = pd.to_numeric(df_rcp_props["TOPOND_CP_N"], errors="coerce").round().astype("Int64")
+            df_ring["TOPOND_CP_N"] = pd.to_numeric(df_ring["TOPOND_CP_N"], errors="coerce").round().astype("Int64")
+        except Exception:
+            pass
         df_rcp_props = pd.concat([df_rcp_props, df_ring[["X_ANGSTROM","Y_ANGSTROM","Z_ANGSTROM"]]], axis=1)
     else:
         df_rcp_props = pd.DataFrame()
 
-    # CCP props
+
     if cont_ccp:
+        df_cage["TOPOND_CP_N"] = topond_ccp_cp_n
         df_cage["X_ANGSTROM"] = df_cage["x_AU"] * bohr_to_ang
         df_cage["Y_ANGSTROM"] = df_cage["y_AU"] * bohr_to_ang
         df_cage["Z_ANGSTROM"] = df_cage["z_AU"] * bohr_to_ang
@@ -1410,6 +2416,11 @@ def parse_trho_out(
         bond_degree_cage = np.where(np.isfinite(rho_cage) & (rho_cage != 0), (vir_cage + gkin_cage) / rho_cage, np.nan)
 
         df_ccp_props = pd.DataFrame({
+            "TOPOND_CP_N": topond_ccp_cp_n,
+            "CP_ATOMS": ccp_cluster_atoms_shown,
+            "CP_CLUSTER_ATOMS": ccp_cluster_atoms_full,
+            "CP_CLUSTER_DISTANCES_ANG": ccp_cluster_distances_full,
+            "CP_CLUSTER_N_ATOMS": ccp_cluster_n_atoms,
             "RHO": rho_cage,
             "GRHO": grho_cage,
             "GKIN": gkin_cage,
@@ -1430,17 +2441,16 @@ def parse_trho_out(
             df_ccp_props["ELFb"] = elfb_cage
 
         df_ccp_props.index = np.arange(1, len(df_ccp_props) + 1)
+        try:
+            df_ccp_props["TOPOND_CP_N"] = pd.to_numeric(df_ccp_props["TOPOND_CP_N"], errors="coerce").round().astype("Int64")
+            df_cage["TOPOND_CP_N"] = pd.to_numeric(df_cage["TOPOND_CP_N"], errors="coerce").round().astype("Int64")
+        except Exception:
+            pass
         df_ccp_props = pd.concat([df_ccp_props, df_cage[["X_ANGSTROM","Y_ANGSTROM","Z_ANGSTROM"]]], axis=1)
     else:
         df_ccp_props = pd.DataFrame()
 
-    # ---- attractors (3,-3) and non-nuclear attractors (NNAs) ----
-    # Mirror analyze_trho_nna_v7.py as closely as possible:
-    #   1) parse the CRYSTAL structural atom table (ATOM N.AT. ...) in Å;
-    #   2) detect TRUE atom indices from "IN THE UNIT CELL" (fallback: all atoms);
-    #   3) scan verbose ATTRACTOR CP TYPE (3,-3) blocks in order;
-    #   4) keep only those whose local block contains the TOPOND warning token;
-    #   5) classify by direct distance to the nearest reference atom.
+
     warning_token = "NON-NUCLEAR ATTRACTOR"
     nna_cols = [
         "CP_ID", "ATTRACTOR_ID", "X_ANGSTROM", "Y_ANGSTROM", "Z_ANGSTROM",
@@ -1466,14 +2476,7 @@ def parse_trho_out(
     _seen_true = set()
     true_idx_list = [x for x in true_idx_list if not (x in _seen_true or _seen_true.add(x))]
 
-    # IMPORTANT: for NNA discrimination we must mirror the external helper behavior
-    # seen in the terminal comparison. In practice, the nearest-atom search must use
-    # the full structural atom table, not the TRHO TRUE-atoms subset, otherwise CPs
-    # that are actually closest to oxygen atoms (e.g. O22) get forced onto Nb TRUE
-    # atoms (e.g. Nb1/Nb5).
-    #
-    # We still parse true_idx_list above for possible future UI/debug use, but the
-    # actual distance classification below uses *all* atoms from the structural block.
+
     if struct_atoms:
         ref_atoms = list(struct_atoms)
     else:
@@ -1575,7 +2578,7 @@ def parse_trho_out(
     df_att_nao_nucl = df_attr.copy()
     nna_count = int(len(df_att_nao_nucl))
 
-    # ---- atoms for CP Viewer: expanded NEA clusters filtered by CP bounding box ----
+
     df_cpviewer_pool_atoms = _parse_non_equiv_atom_clusters(txt, bohr_to_ang=bohr_to_ang)
     df_cpviewer_atoms = _select_cpviewer_atoms_bbox(
         df_cpviewer_pool_atoms,
@@ -1586,13 +2589,12 @@ def parse_trho_out(
         margin_ang=2.5,
     )
     if df_cpviewer_atoms is None or df_cpviewer_atoms.empty:
-        # Conservative fallback: the old compact topological context may still be useful
-        # when the cluster block is absent or the CP bounding box becomes too restrictive.
+
+
         df_cpviewer_atoms = _parse_unique_atom_pairs_considered(txt, bohr_to_ang=bohr_to_ang)
 
-    # ---- mapear para pt_* (opcional, mas você usa na visualização)
-    # só calcula se todos os parâmetros vierem
-    df_bcp_coords = df_bcp[["X_ANGSTROM","Y_ANGSTROM","Z_ANGSTROM"]].copy()
+
+    df_bcp_coords = df_bcp[["TOPOND_CP_N","X_ANGSTROM","Y_ANGSTROM","Z_ANGSTROM"]].copy()
     if all(v is not None for v in [xmi,xma,ymi,yma,zmi,zma,x_inc,y_inc,n_planos,delta_z]):
         dx = (xma - xmi); dy = (yma - ymi); dz = (zma - zmi)
         xce = xmi + dx/2; yce = ymi + dy/2; zce = zmi + dz/2
@@ -1723,7 +2725,7 @@ def parse_tlap_out(
     cp_rows = []
     nea_rows = []
 
-    # split output into NEA blocks first
+
     blocks = []
     current = None
     for ln in lines:
@@ -1761,7 +2763,7 @@ def parse_tlap_out(
             "NFOUND": int(blk.get("NFOUND", 0) or 0),
         })
 
-        # detailed CP blocks inside this NEA block
+
         detailed = []
         current_cp = None
         for ln in blines:
@@ -1806,7 +2808,7 @@ def parse_tlap_out(
         if isinstance(current_cp, dict) and current_cp.get("CP_N") is not None:
             detailed.append(current_cp)
 
-        # compact final table: nearest atom line comes after each compact CP row
+
         compact_rows = []
         pending = None
         for ln in blines:
@@ -1837,7 +2839,7 @@ def parse_tlap_out(
                     pending = None
                     continue
 
-        # merge compact nearest-atom information back into detailed rows by order
+
         for idx_cp, cp in enumerate(detailed):
             if idx_cp < len(compact_rows):
                 comp = compact_rows[idx_cp]
@@ -1886,10 +2888,6 @@ def parse_tlap_out(
     )
 
 
-# -----------------------------
-# Main App
-# -----------------------------
-
 class SettingsDialog(tk.Toplevel):
     """Minimal Settings dialog (Phase 0): only 'properties' executable path."""
     def __init__(self, app: "App"):
@@ -1897,6 +2895,7 @@ class SettingsDialog(tk.Toplevel):
         self.app = app
         _ensure_floating_window(self)
         self.title("Settings")
+        apply_topiso3d_window_icon(self)
         self.resizable(False, False)
         self.transient(app)
         self.grab_set()
@@ -1929,7 +2928,7 @@ class SettingsDialog(tk.Toplevel):
         self.lbl_test = ttk.Label(body, text=" ")
         self.lbl_test.grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
-        # --- Visualization defaults ---
+
         ttk.Label(body, text="Visualization", font=("TkDefaultFont", 11, "bold")).grid(row=4, column=0, sticky="w", columnspan=3, pady=(14, 6))
         ttk.Label(body, text="Laplacian isosurface colors:").grid(row=5, column=0, sticky="w")
         scheme_key = (self.app._settings.get("laplacian_scheme") or "blue_red").strip() or "blue_red"
@@ -1961,24 +2960,49 @@ class SettingsDialog(tk.Toplevel):
         ttk.Radiobutton(body, text="None (keep all files)", variable=self.var_cleanup_policy,
                         value="none").grid(row=13, column=0, columnspan=3, sticky="w", pady=(2, 0))
 
-        def do_test():
+        ttk.Label(body, text="External result file names", font=("TkDefaultFont", 11, "bold")).grid(row=14, column=0, sticky="w", columnspan=3, pady=(14, 6))
+        ttk.Label(body, text="TRHO output names (semicolon separated):").grid(row=15, column=0, sticky="w", columnspan=3)
+        self.var_trho_outputs = tk.StringVar(value=format_output_name_list(self.app._settings.get("trho_output_names"), DEFAULT_TRHO_OUTPUT_NAMES))
+        ttk.Entry(body, textvariable=self.var_trho_outputs, width=56).grid(row=16, column=0, sticky="we", columnspan=3, pady=(4, 0))
+
+        ttk.Label(body, text="TLAP output names (semicolon separated):").grid(row=17, column=0, sticky="w", columnspan=3, pady=(10, 0))
+        self.var_tlap_outputs = tk.StringVar(value=format_output_name_list(self.app._settings.get("tlap_output_names"), DEFAULT_TLAP_OUTPUT_NAMES))
+        ttk.Entry(body, textvariable=self.var_tlap_outputs, width=56).grid(row=18, column=0, sticky="we", columnspan=3, pady=(4, 0))
+
+        ttk.Label(body, text="ATBP output names (semicolon separated):").grid(row=19, column=0, sticky="w", columnspan=3, pady=(10, 0))
+        self.var_atbp_outputs = tk.StringVar(value=format_output_name_list(self.app._settings.get("atbp_output_names"), DEFAULT_ATBP_OUTPUT_NAMES))
+        ttk.Entry(body, textvariable=self.var_atbp_outputs, width=56).grid(row=20, column=0, sticky="we", columnspan=3, pady=(4, 0))
+
+        ttk.Label(body, text="These names are used only when reading external results. Internal TopIso3D runs still write trho.out, tlap.out and atbp.out.", wraplength=520, justify="left").grid(row=21, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        def do_test(show_dialog: bool = False) -> bool:
             exe = self.var_prop.get().strip()
-            rp = resolve_executable(exe)
-            if rp and rp.exists():
+            ok, kind, msg, rp = validate_properties_executable(exe)
+            if ok:
                 self.lbl_test.configure(text=f"✔ OK: {rp}")
-            else:
-                self.lbl_test.configure(text="✖ Not found. Use an absolute path or ensure 'properties' is in PATH.")
+                if show_dialog:
+                    messagebox.showinfo("Settings", f"The selected properties executable was successfully validated and can be launched by TopIso3D.\n\n"
+                                        f"Path:\n{rp}", parent=self)
+                return True
+
+            short = "✖ " + (msg.split("\n", 1)[0] if msg else "Invalid properties executable.")
+            self.lbl_test.configure(text=short)
+            if show_dialog:
+                messagebox.showerror("Settings", msg + "\n\nPlease check the path in Settings.", parent=self)
+            return False
 
         btnrow = ttk.Frame(body)
-        btnrow.grid(row=14, column=0, columnspan=3, sticky="e", pady=(12, 0))
+        btnrow.grid(row=22, column=0, columnspan=3, sticky="e", pady=(12, 0))
 
-        ttk.Button(btnrow, text="Test", command=do_test).pack(side="left")
+        ttk.Button(btnrow, text="Test", command=lambda: do_test(True)).pack(side="left")
         ttk.Button(btnrow, text="Cancel", command=self.destroy).pack(side="right", padx=(8, 0))
 
         def save_and_close():
             exe = self.var_prop.get().strip()
-            if not exe:
-                messagebox.showerror("Settings", "Please set the 'properties' executable path (or command in PATH).")
+            ok, kind, msg, rp = validate_properties_executable(exe)
+            if not ok:
+                self.lbl_test.configure(text="✖ " + (msg.split("\n", 1)[0] if msg else "Invalid properties executable."))
+                messagebox.showerror("Settings", msg + "\n\nPlease check the path in Settings before saving.", parent=self)
                 return
 
             try:
@@ -1990,15 +3014,18 @@ class SettingsDialog(tk.Toplevel):
                 messagebox.showerror("Settings", "NNA classification cutoff must be greater than zero.")
                 return
 
-            # Save to disk
+
             data = load_settings()
-            data["properties_exe"] = exe
+            data["properties_exe"] = str(rp or exe)
             data["nna_cutoff_ang"] = float(nna_cutoff)
             cleanup_policy = str(self.var_cleanup_policy.get() or "minimal").strip().lower()
             if cleanup_policy not in ("minimal", "standard", "none"):
                 cleanup_policy = "minimal"
             data["cleanup_policy"] = cleanup_policy
-            # Visualization defaults
+            data["trho_output_names"] = parse_output_name_list(self.var_trho_outputs.get(), DEFAULT_TRHO_OUTPUT_NAMES)
+            data["tlap_output_names"] = parse_output_name_list(self.var_tlap_outputs.get(), DEFAULT_TLAP_OUTPUT_NAMES)
+            data["atbp_output_names"] = parse_output_name_list(self.var_atbp_outputs.get(), DEFAULT_ATBP_OUTPUT_NAMES)
+
             try:
                 scheme_label = self.var_lap_scheme.get().strip()
                 scheme_map = {
@@ -2011,19 +3038,25 @@ class SettingsDialog(tk.Toplevel):
                 data["laplacian_scheme"] = "blue_red"
             save_settings(data)
 
-            # Apply live
+
             self.app._settings = data
-            self.app.state.properties_exe = Path(exe)
+            self.app.state.properties_exe = Path(str(rp or exe))
             self.app.state.laplacian_scheme = (data.get("laplacian_scheme") or "blue_red").strip() or "blue_red"
             self.app.state.nna_cutoff_ang = float(data.get("nna_cutoff_ang", 0.35) or 0.35)
             self.app.state.cleanup_policy = str(data.get("cleanup_policy") or "minimal").strip().lower() or "minimal"
+            self.app._settings["trho_output_names"] = parse_output_name_list(data.get("trho_output_names"), DEFAULT_TRHO_OUTPUT_NAMES)
+            self.app._settings["tlap_output_names"] = parse_output_name_list(data.get("tlap_output_names"), DEFAULT_TLAP_OUTPUT_NAMES)
+            self.app._settings["atbp_output_names"] = parse_output_name_list(data.get("atbp_output_names"), DEFAULT_ATBP_OUTPUT_NAMES)
 
-            # Refresh UI hints/status
+
             try:
                 self.app.set_status("Settings saved ✓")
-                self.app.refresh_all_pages()
+                self.app.re_scan_external_results_after_settings_change()
             except Exception:
-                pass
+                try:
+                    self.app.refresh_all_pages()
+                except Exception:
+                    pass
 
             self.destroy()
 
@@ -2031,8 +3064,8 @@ class SettingsDialog(tk.Toplevel):
 
         body.columnconfigure(0, weight=1)
 
-        # Auto-test on open (non-blocking UX)
-        self.after(50, do_test)
+
+        self.after(50, lambda: do_test(False))
 
 
 class CreateToolTip:
@@ -2102,7 +3135,6 @@ class CreateToolTip:
                 pass
 
 
-
 class _RunNameDialog(tk.Toplevel):
     """Small themed dialog to ask the user for a run name."""
     def __init__(self, parent, title: str, prompt: str, initialvalue: str = ""):
@@ -2111,6 +3143,7 @@ class _RunNameDialog(tk.Toplevel):
         self.parent = parent
         self.result = None
         self.title(title)
+        apply_topiso3d_window_icon(self)
         self.resizable(False, False)
         self.transient(parent)
         self.grab_set()
@@ -2217,35 +3250,44 @@ def _ask_run_name(parent, title: str, prompt: str, initialvalue: str = ""):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
+        self._applied_tk_scaling = apply_platform_ui_scaling(self)
         self.withdraw()
-        # Ensure the main window is decorated and movable (important on some VMs).
+        self._splash_win = None
+        self._splash_start_time = None
+        self._splash_logo_img = None
+
         _ensure_floating_window(self)
-        self.title("TopIso3D v2026 - CP Viewer v20")
-        # Standard initial window size (avoid resize jumps across pages)
-        self.geometry("1200x820")
-        self.minsize(1100, 720)
+        configure_windows_app_id()
+        self.title("TopIso3D v2026")
+        apply_topiso3d_window_icon(self)
+        self._show_startup_splash()
+
+        self.geometry("1180x800")
+        self.minsize(980, 640)
         self.resizable(True, True)
 
-        # Make sure the window can always be closed from the window manager.
+
         self.protocol("WM_DELETE_WINDOW", self.destroy)
 
-        # v2-like color palette for ttk widgets
+
+        self._configure_platform_fonts()
         self._apply_theme()
         self.state = ProjectContext()
 
-        # Backward-compatible alias (some pages expect app.ctx)
+
         self.ctx = self.state
-        # CRYSTAL/TOPOND executable (used by TRHO/PL2D/ATBP).
-        # Loaded from Settings; fallback to a sensible default.
+
+
         self._settings = load_settings()
+        self._settings["trho_output_names"] = parse_output_name_list(self._settings.get("trho_output_names"), DEFAULT_TRHO_OUTPUT_NAMES)
+        self._settings["tlap_output_names"] = parse_output_name_list(self._settings.get("tlap_output_names"), DEFAULT_TLAP_OUTPUT_NAMES)
+        self._settings["atbp_output_names"] = parse_output_name_list(self._settings.get("atbp_output_names"), DEFAULT_ATBP_OUTPUT_NAMES)
         pexe = (self._settings.get("properties_exe") or "").strip()
         if pexe:
             self.state.properties_exe = Path(pexe)
         else:
-            # Keep your current default (Crystal VM), but allow PATH-based command too.
-            default_abs = Path("/usr/crysprop/CRYSTAL_f_orb/properties")
-            self.state.properties_exe = default_abs if default_abs.exists() else Path("properties")
-        # User-configurable visualization defaults
+            self.state.properties_exe = resolve_default_properties_executable()
+
         self.state.laplacian_scheme = (self._settings.get("laplacian_scheme") or "blue_red").strip() or "blue_red"
         try:
             self.state.nna_cutoff_ang = float(self._settings.get("nna_cutoff_ang", 0.35) or 0.35)
@@ -2255,115 +3297,356 @@ class App(tk.Tk):
         if self.state.cleanup_policy not in ("minimal", "standard", "none"):
             self.state.cleanup_policy = "minimal"
 
-        # job plumbing
+        try:
+            log_event(self.state, "startup diagnostics: " + json.dumps(collect_system_diagnostics(self), ensure_ascii=False))
+        except Exception:
+            pass
+
+
+        self._current_page_key = "Workspace"
+        self._current_page = None
+        self._ui_refresh_ms = 700 if is_windows() else 400
+        self._last_ui_snapshot = None
+
+
+        self._refresh_ui_after_id = None
+
+
         self._job_thread: Optional[threading.Thread] = None
         self._job_queue: "queue.Queue[tuple]" = queue.Queue()
         self._job_running = False
+        self._active_process = None
+        self._active_job_kind = ""
+        self._job_abort_requested = False
 
         self._build_layout()
+        self._build_menubar()
         self._create_pages()
         self._build_sidebar()
+        self._current_page = self.pages.get("Workspace")
 
         self.show_page("Workspace")
 
-        # start queue polling
+
         self.after(100, self._poll_job_queue)
-        self.after(200, self.refresh_ui_state)
+        self._schedule_refresh_ui_state()
 
         self.update_idletasks()
-        self.after(10, self.deiconify)
+        self.after(10, self._finish_startup)
+
+
+    def _show_startup_splash(self):
+        """Show a lightweight branded startup splash using the TopIso3D palette.
+
+        This does not make the first launch faster, but it prevents users from
+        thinking that nothing is happening while the frozen bundle initializes.
+        The progress indicator is drawn with a Canvas instead of ttk.Progressbar
+        so it does not inherit platform colors such as blue on macOS/Windows.
+        """
+        try:
+            self._splash_start_time = time.perf_counter()
+            splash = tk.Toplevel(self)
+            self._splash_win = splash
+            splash.title("TopIso3D v2026")
+            apply_topiso3d_window_icon(splash)
+            splash.configure(bg=UI_BG_MAIN)
+            splash.resizable(False, False)
+            # Do not mark the splash as topmost. On Windows/macOS, a topmost
+            # splash can leave the main window behaving as if it were always
+            # above other applications after startup.
+            try:
+                splash.attributes("-topmost", False)
+            except Exception:
+                pass
+            try:
+                splash.overrideredirect(True)
+            except Exception:
+                pass
+
+            outer = tk.Frame(
+                splash,
+                bg=UI_BG_MAIN,
+                highlightthickness=1,
+                highlightbackground=UI_BG_DARK,
+                padx=0,
+                pady=0,
+            )
+            outer.pack(fill="both", expand=True)
+
+            header = tk.Frame(outer, bg=UI_BG_DARK, padx=28, pady=14)
+            header.pack(fill="x")
+            tk.Label(
+                header,
+                text="TopIso3D v2026",
+                bg=UI_BG_DARK,
+                fg=UI_ACCENT,
+                font=("Arial", 20, "bold"),
+            ).pack(anchor="center")
+
+            body = tk.Frame(outer, bg=UI_BG_MAIN, padx=28, pady=20)
+            body.pack(fill="both", expand=True)
+
+
+            logo_path = find_splash_logo_path()
+            if logo_path is not None:
+                try:
+                    img = tk.PhotoImage(file=str(logo_path))
+                    try:
+                        w = int(img.width())
+                        h = int(img.height())
+                        max_dim = max(w, h)
+                        if max_dim > SPLASH_LOGO_MAX_PX:
+
+
+                            factor = max(1, int(round(max_dim / SPLASH_LOGO_MAX_PX)))
+                            img = img.subsample(factor, factor)
+                    except Exception:
+                        pass
+                    self._splash_logo_img = img
+                    tk.Label(
+                        body,
+                        image=self._splash_logo_img,
+                        bg=UI_BG_MAIN,
+                        borderwidth=0,
+                        highlightthickness=0,
+                    ).pack(anchor="center", pady=(0, 12))
+                except Exception:
+                    self._splash_logo_img = None
+
+            tk.Label(
+                body,
+                text="Scientific topological analysis environment",
+                bg=UI_BG_MAIN,
+                fg=UI_FG_MAIN,
+                font=("Arial", 11, "bold"),
+                justify="center",
+            ).pack(anchor="center", pady=(0, 8))
+
+            tk.Label(
+                body,
+                text="The first launch after installation may take a little longer.\nPlease wait.",
+                bg=UI_BG_MAIN,
+                fg=UI_FG_MAIN,
+                font=("Arial", 10),
+                justify="center",
+            ).pack(anchor="center", pady=(0, 14))
+
+            bar_w = 280
+            bar_h = 14
+            bar = tk.Canvas(
+                body,
+                width=bar_w,
+                height=bar_h,
+                bg=UI_BG_MAIN,
+                highlightthickness=0,
+                bd=0,
+            )
+            bar.pack(anchor="center", fill="x")
+            bar.create_rectangle(0, 0, bar_w, bar_h, outline=UI_BG_DARK, fill=UI_BG_PANEL)
+            bar.create_rectangle(2, 2, int(bar_w * 0.72), bar_h - 2, outline=UI_ACCENT, fill=UI_ACCENT)
+
+            try:
+                splash.update_idletasks()
+                w = max(430, splash.winfo_reqwidth())
+                h = max(245, splash.winfo_reqheight())
+                sw = splash.winfo_screenwidth()
+                sh = splash.winfo_screenheight()
+                x = max(0, (sw - w) // 2)
+                y = max(0, (sh - h) // 2)
+                splash.geometry(f"{w}x{h}+{x}+{y}")
+                splash.update()
+            except Exception:
+                pass
+        except Exception:
+            self._splash_win = None
+            self._splash_start_time = None
+            self._splash_logo_img = None
+
+    def _finish_startup(self):
+        """Display the main window and close the startup splash.
+
+        The splash remains visible for at least SPLASH_MIN_VISIBLE_MS.  On slow
+        first launches it naturally stays open longer; on fast launches this
+        prevents it from just flashing on the screen.
+        """
+        try:
+            splash = getattr(self, "_splash_win", None)
+            started = getattr(self, "_splash_start_time", None)
+            if splash is not None and started is not None:
+                elapsed_ms = int((time.perf_counter() - float(started)) * 1000)
+                remaining_ms = int(SPLASH_MIN_VISIBLE_MS) - elapsed_ms
+                if remaining_ms > 0:
+                    self.after(remaining_ms, self._finish_startup)
+                    return
+        except Exception:
+            pass
+
+        try:
+            self.deiconify()
+            try:
+                self.attributes("-topmost", False)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        try:
+            splash = getattr(self, "_splash_win", None)
+            if splash is not None and splash.winfo_exists():
+                splash.destroy()
+        except Exception:
+            pass
+        self._splash_win = None
+        self._splash_start_time = None
+        self._splash_logo_img = None
+
+
+    def _configure_platform_fonts(self):
+        """Tune default Tk fonts per OS to improve visual quality, especially on Windows."""
+        try:
+            if is_windows():
+                family = "Segoe UI"
+                size = 10
+                title_family = "Segoe UI Semibold"
+            elif is_macos():
+                family = "Helvetica"
+                size = 12
+                title_family = "Helvetica"
+            else:
+                family = "DejaVu Sans"
+                size = 10
+                title_family = "DejaVu Sans"
+            self._ui_font_family = family
+            self._ui_font_size = size
+            self._ui_title_family = title_family
+
+            for name in (
+                "TkDefaultFont",
+                "TkTextFont",
+                "TkMenuFont",
+                "TkHeadingFont",
+                "TkCaptionFont",
+                "TkSmallCaptionFont",
+                "TkIconFont",
+                "TkTooltipFont",
+            ):
+                try:
+                    f = tkfont.nametofont(name)
+                    f.configure(family=family, size=size)
+                except Exception:
+                    pass
+
+            try:
+                self.option_add("*Font", f"{{{family}}} {size}")
+                self.option_add("*Menu.Font", f"{{{family}}} {size}")
+                self.option_add("*TCombobox*Listbox.font", f"{{{family}}} {size}")
+            except Exception:
+                pass
+        except Exception:
+            self._ui_font_family = "TkDefaultFont"
+            self._ui_font_size = 10
+            self._ui_title_family = "TkDefaultFont"
 
     def _apply_theme(self):
-        """Apply a v2-like color palette to ttk widgets (clam theme for better styling)."""
+        """Apply a v2-like color palette with platform-tuned fonts and spacing."""
         try:
             style = ttk.Style(self)
-            # 'clam' is the most predictable for custom colors across platforms
             try:
                 style.theme_use("clam")
             except Exception:
                 pass
 
-            # Root background (covers non-ttk areas)
+            family = getattr(self, "_ui_font_family", "TkDefaultFont")
+            base_size = int(getattr(self, "_ui_font_size", 10) or 10)
+            title_family = getattr(self, "_ui_title_family", family)
+
             self.configure(bg=UI_BG_MAIN)
 
-            style.configure(".", background=UI_BG_MAIN, foreground=UI_FG_MAIN)
+            style.configure(".", background=UI_BG_MAIN, foreground=UI_FG_MAIN, font=(family, base_size))
             style.configure("TFrame", background=UI_BG_MAIN)
             style.configure("Sidebar.TFrame", background=UI_BG_MAIN)
             style.configure("Content.TFrame", background=UI_BG_MAIN)
             style.configure("Status.TFrame", background=UI_BG_MAIN)
 
-            style.configure("TLabel", background=UI_BG_MAIN, foreground=UI_FG_MAIN)
-            style.configure("Muted.TLabel", background=UI_BG_MAIN, foreground=UI_FG_MUTED)
+            style.configure("TLabel", background=UI_BG_MAIN, foreground=UI_FG_MAIN, font=(family, base_size))
+            style.configure("Muted.TLabel", background=UI_BG_MAIN, foreground=UI_FG_MUTED, font=(family, base_size))
             style.configure(
                 "Title.TLabel",
                 background=UI_BG_DARK,
                 foreground=UI_ACCENT,
-                font=("Arial", 13, "bold"),
-                padding=(8, 6),
+                font=(title_family, base_size + 3, "bold"),
+                padding=(10, 8),
             )
-            # Same as Title.TLabel, but centers the text while allowing the label to stretch.
             style.configure(
                 "TitleCenter.TLabel",
                 background=UI_BG_DARK,
                 foreground=UI_ACCENT,
-                font=("Arial", 13, "bold"),
-                padding=(8, 6),
+                font=(title_family, base_size + 3, "bold"),
+                padding=(10, 8),
                 anchor="center",
             )
 
             style.configure("TLabelframe", background=UI_BG_MAIN, foreground=UI_FG_MAIN)
-            style.configure("TLabelframe.Label", background=UI_BG_MAIN, foreground=UI_FG_MAIN)
+            style.configure("TLabelframe.Label", background=UI_BG_MAIN, foreground=UI_FG_MAIN, font=(family, base_size, "bold"))
 
-            style.configure("TButton", background=UI_ACCENT, foreground=UI_FG_MAIN, padding=(10, 6))
+            style.configure("TButton", background=UI_ACCENT, foreground=UI_FG_MAIN, padding=(12, 8), font=(family, base_size))
             style.map(
                 "TButton",
                 background=[("active", UI_ACCENT), ("pressed", UI_ACCENT), ("disabled", UI_BG_PANEL)],
                 foreground=[("disabled", UI_FG_MUTED)],
             )
 
-            # Sidebar navigation buttons (font via Style; avoids ttk "-font" error)
-            style.configure("SidebarNav.TButton", font=("TkDefaultFont", 10, "bold"), padding=(10, 6))
-            style.configure("SidebarNavLeft.TButton", font=("TkDefaultFont", 10, "bold"), padding=(10, 6), anchor="w")
-            style.configure("SidebarNavCenter.TButton", font=("TkDefaultFont", 10, "bold"), padding=(10, 6), anchor="center")
+            style.configure("SidebarNav.TButton", font=(family, base_size, "bold"), padding=(12, 8))
+            style.configure("SidebarNavLeft.TButton", font=(family, base_size, "bold"), padding=(12, 8), anchor="w")
+            style.configure("SidebarNavCenter.TButton", font=(family, base_size, "bold"), padding=(12, 8), anchor="center")
 
-            style.configure("TCheckbutton", background=UI_BG_MAIN, foreground=UI_FG_MAIN)
+            style.configure("TCheckbutton", background=UI_BG_MAIN, foreground=UI_FG_MAIN, font=(family, base_size))
 
-            style.configure("TEntry", fieldbackground=UI_BG_FIELD, foreground=UI_FG_MAIN)
-            style.configure("TCombobox", fieldbackground=UI_BG_FIELD, foreground=UI_FG_MAIN)
+            style.configure("TEntry", fieldbackground=UI_BG_FIELD, foreground=UI_FG_MAIN, padding=5, insertwidth=1)
+            style.configure("TCombobox", fieldbackground=UI_BG_FIELD, foreground=UI_FG_MAIN, padding=5, arrowsize=14)
             style.map("TCombobox", fieldbackground=[("readonly", UI_BG_FIELD)])
 
             style.configure("TSeparator", background=UI_BG_DARK)
-
             style.configure("TProgressbar", troughcolor=UI_BG_PANEL, background=UI_ACCENT)
 
-            style.configure("Treeview", background=UI_BG_FIELD, fieldbackground=UI_BG_FIELD, foreground=UI_FG_MAIN)
-            style.configure("Treeview.Heading", background=UI_BG_DARK, foreground=UI_ACCENT)
+            style.configure(
+                "Treeview",
+                background=UI_BG_FIELD,
+                fieldbackground=UI_BG_FIELD,
+                foreground=UI_FG_MAIN,
+                font=(family, base_size),
+                rowheight=24,
+            )
+            style.configure("Treeview.Heading", background=UI_BG_DARK, foreground=UI_ACCENT, font=(family, base_size, "bold"))
             style.map("Treeview.Heading", background=[("active", UI_BG_DARK)])
+
+            try:
+                self.option_add("*Listbox.font", f"{{{family}}} {base_size}")
+                self.option_add("*Text.font", f"{{{family}}} {base_size}")
+            except Exception:
+                pass
         except Exception:
-            # If styling fails for any reason, keep the default theme.
             pass
 
-    # ---------- Layout ----------
+
     def _build_layout(self):
         self.columnconfigure(1, weight=1)
         self.rowconfigure(0, weight=1)
 
-        # Sidebar
+
         self.sidebar = ttk.Frame(self, padding=(12, 12), style="Sidebar.TFrame")
         self.sidebar.grid(row=0, column=0, sticky="nsw")
         self.sidebar.columnconfigure(0, weight=1)
         self.sidebar.rowconfigure(4, weight=1)
 
-        
-        # App title: stretch to the full sidebar width and center the text.
+
         ttk.Label(self.sidebar, text="TopIso3D v2026", style="TitleCenter.TLabel").grid(
             row=0, column=0, sticky="ew"
         )
-        # Fixed-height workspace path area (max ~3 lines)
+
         self.ws_area = ttk.Frame(self.sidebar)
         self.ws_area.grid(row=1, column=0, sticky="ew", pady=(6, 10))
         self.ws_area.columnconfigure(0, weight=1)
-        # Reserve a constant vertical space so the sidebar doesn't jump when the path wraps
+
         self.sidebar.grid_rowconfigure(1, minsize=54)
         self.lbl_workspace = ttk.Label(
             self.ws_area,
@@ -2376,12 +3659,9 @@ class App(tk.Tk):
         self.lbl_workspace.grid(row=0, column=0, sticky="nsew")
         self._ws_tooltip = CreateToolTip(self.lbl_workspace, text="")
 
-        # Settings (separated from workflow navigation)
-        # Keep the same left alignment as the workflow buttons by using the same
-        # two-column row layout (badge + button).
+
         settings_row = ttk.Frame(self.sidebar)
         settings_row.grid(row=2, column=0, sticky="ew", pady=(0, 10))
-        settings_row.columnconfigure(1, weight=1)
         ttk.Label(settings_row, text=" ", width=2).grid(row=0, column=0, sticky="w")
         ttk.Button(
             settings_row,
@@ -2389,31 +3669,29 @@ class App(tk.Tk):
             command=self.open_settings,
             style="SidebarNavCenter.TButton",
             width=SIDEBAR_BTN_WIDTH,
-        ).grid(row=0, column=1, sticky="ew")
+        ).grid(row=0, column=1, sticky="w")
 
         ttk.Separator(self.sidebar).grid(row=3, column=0, sticky="ew", pady=(0, 10))
 
         self.nav_frame = ttk.Frame(self.sidebar)
         self.nav_frame.grid(row=4, column=0, sticky="nsew")
-        self.nav_frame.columnconfigure(0, weight=1)
 
-        # Quick help/about (kept at bottom)
+
         ttk.Separator(self.sidebar).grid(row=5, column=0, sticky="ew", pady=(10, 10))
         qa = ttk.Frame(self.sidebar)
         qa.grid(row=6, column=0, sticky="ew")
-        qa.columnconfigure(1, weight=1)
-        # Keep the same visual width as the workflow buttons (badge + button).
-        ttk.Label(qa, text=" ", width=2).grid(row=0, column=0, rowspan=2, sticky="nw")
-        ttk.Button(qa, text="Help", command=self._help, style="SidebarNav.TButton", width=SIDEBAR_BTN_WIDTH).grid(row=0, column=1, sticky="ew")
-        ttk.Button(qa, text="About", command=self._about, style="SidebarNav.TButton", width=SIDEBAR_BTN_WIDTH).grid(row=1, column=1, sticky="ew", pady=(6, 0))
 
-        # Content area
+        ttk.Label(qa, text=" ", width=2).grid(row=0, column=0, rowspan=2, sticky="nw")
+        ttk.Button(qa, text="Help", command=self._help, style="SidebarNav.TButton", width=SIDEBAR_BTN_WIDTH).grid(row=0, column=1, sticky="w")
+        ttk.Button(qa, text="About", command=self._about, style="SidebarNav.TButton", width=SIDEBAR_BTN_WIDTH).grid(row=1, column=1, sticky="w", pady=(6, 0))
+
+
         self.content = ttk.Frame(self, padding=(16, 16), style="Content.TFrame")
         self.content.grid(row=0, column=1, sticky="nsew")
         self.content.rowconfigure(0, weight=1)
         self.content.columnconfigure(0, weight=1)
 
-        # Status bar + task panel
+
         self.status_var = tk.StringVar(value="Ready.")
         self.task_text_var = tk.StringVar(value="")
 
@@ -2425,7 +3703,7 @@ class App(tk.Tk):
 
         self.task_bar = ttk.Progressbar(self.statusbar, mode="determinate", length=240, maximum=100, value=0)
         self.task_bar.grid(row=0, column=1, sticky="e", padx=(12, 8))
-        # Hide the global progress bar (TRHO has its own progress bar in the Compute (TRHO) page)
+
         self.task_bar.grid_remove()
         ttk.Label(self.statusbar, textvariable=self.task_text_var).grid(row=0, column=2, sticky="e")
         ttk.Button(self.statusbar, text="Execution Details…", command=self.show_execution_details).grid(row=0, column=3, sticky="e", padx=(8, 0))
@@ -2433,10 +3711,10 @@ class App(tk.Tk):
         self.lbl_bits = ttk.Label(self.statusbar, text="—")
         self.lbl_bits.grid(row=0, column=4, sticky="e", padx=(12, 0))
 
-        # Details window (created lazily)
+
         self._task_win = None
 
-    # ---------- Pages ----------
+
     def _create_pages(self):
         self.pages = {}
         for key, cls in [
@@ -2455,14 +3733,16 @@ class App(tk.Tk):
             self.pages[key] = p
 
     def _build_sidebar(self):
+
+
         self.nav_items = [
             ("Workspace", "Workspace"),
             ("TRHO", "Compute"),
             ("TLAP", "TLAP"),
-            ("CP Viewer", "CP Viewer"),
             ("PL2D", "PL2D"),
-            ("PL2D Viewer", "PL2D Viewer"),
             ("ATBP", "ATBP"),
+            ("CP Viewer", "CP Viewer"),
+            ("PL2D Viewer", "PL2D Viewer"),
             ("BCP Evaluation", "BCP Evaluation"),
             ("Reports", "Reports"),
         ]
@@ -2472,33 +3752,49 @@ class App(tk.Tk):
 
         for r, (label, key) in enumerate(self.nav_items):
             row = ttk.Frame(self.nav_frame)
-            row.grid(row=r, column=0, sticky="ew", pady=3)
-            row.columnconfigure(1, weight=1)
+            row.grid(row=r, column=0, sticky="w", pady=3)
 
             badge = ttk.Label(row, text=" ", width=2)
             badge.grid(row=0, column=0, sticky="w")
             btn = ttk.Button(row, text=label, command=lambda k=key: self.show_page(k), style="SidebarNav.TButton", width=SIDEBAR_BTN_WIDTH)
-            btn.grid(row=0, column=1, sticky="ew")
+            btn.grid(row=0, column=1, sticky="w")
 
             self.nav_badges[key] = badge
             self.nav_buttons[key] = btn
             self.nav_tooltips[key] = CreateToolTip(btn, text="")
 
-    # ---------- Navigation ----------
+
     def show_page(self, key: str):
         page = self.pages[key]
+        self._current_page_key = key
+        self._current_page = page
         page.tkraise()
-        # Some pages may not implement on_show(); keep navigation robust.
+
+
+        try:
+            refresh_state = getattr(page, "refresh_state", None)
+            if callable(refresh_state):
+                refresh_state()
+        except Exception as e:
+            self._job_queue.put(("log", f"[UI] refresh_state error in {key}: {e}"))
+
+        try:
+            refresh = getattr(page, "refresh", None)
+            if callable(refresh):
+                refresh()
+        except Exception as e:
+            self._job_queue.put(("log", f"[UI] refresh error in {key}: {e}"))
+
+
         on_show = getattr(page, "on_show", None)
         if callable(on_show):
             try:
                 on_show()
             except Exception as e:
-                # Avoid crashing the GUI due to a page refresh error.
-                self._job_queue.put(("log", f"[UI] on_show error in {key}: {e}"))
-        
 
-    # ---------- Status / task panel ----------
+                self._job_queue.put(("log", f"[UI] on_show error in {key}: {e}"))
+
+
     def set_status(self, msg: str):
         self.state.status = msg
         self.status_var.set(msg)
@@ -2525,10 +3821,10 @@ class App(tk.Tk):
         self._task_details = {"text": text, "done": done, "total": total}
         self._update_task_details_window()
 
-    
+
     def show_execution_details(self):
         """Show execution details (task + last run metadata/output)."""
-        # Reuse the existing Task Details window but present it as Execution Details.
+
         self.show_task_details()
         try:
             if getattr(self, "_task_win", None) is not None and self._task_win.winfo_exists():
@@ -2540,6 +3836,7 @@ class App(tk.Tk):
             self._task_win = tk.Toplevel(self)
             _ensure_floating_window(self._task_win)
             self._task_win.title("Task Details")
+            apply_topiso3d_window_icon(self._task_win)
             self._task_win.geometry("560x360")
             self._task_win.protocol("WM_DELETE_WINDOW", self._task_win.withdraw)
 
@@ -2556,7 +3853,7 @@ class App(tk.Tk):
             self._task_details_counts = ttk.Label(frm, text="—")
             self._task_details_counts.pack(anchor="w", pady=(8, 6))
 
-            # Last execution metadata (filled when available)
+
             self._exec_meta_label = ttk.Label(frm, text="—", wraplength=520, style="Muted.TLabel")
             self._exec_meta_label.pack(anchor="w", pady=(0, 10))
 
@@ -2572,7 +3869,10 @@ class App(tk.Tk):
 
         self._update_task_details_window()
         self._task_win.deiconify()
-        self._task_win.lift()
+        try:
+            self._task_win.attributes("-topmost", False)
+        except Exception:
+            pass
 
     def task_log(self, line: str):
         if getattr(self, "_task_win", None) is not None and self._task_win.winfo_exists():
@@ -2582,7 +3882,7 @@ class App(tk.Tk):
     def _update_task_details_window(self):
         if getattr(self, "_task_win", None) is None or not self._task_win.winfo_exists():
             return
-        # Update execution metadata (if any)
+
         try:
             le = getattr(self.state, "last_execution", None)
             if hasattr(self, "_exec_meta_label") and self._exec_meta_label.winfo_exists():
@@ -2612,7 +3912,92 @@ class App(tk.Tk):
             self._task_details_progress.config(maximum=100, value=0)
             self._task_details_counts.config(text="—")
 
-    # ---------- Workspace auto-validation (NO side effects) ----------
+    def _register_active_process(self, proc, job_kind: str) -> None:
+        self._active_process = proc
+        self._active_job_kind = str(job_kind or "").strip().upper()
+
+    def _clear_active_process(self, proc=None) -> None:
+        current = getattr(self, "_active_process", None)
+        if proc is not None and current is not None and current is not proc:
+            return
+        self._active_process = None
+        self._active_job_kind = ""
+
+    def _job_was_aborted(self, job_kind: str = "") -> bool:
+        if not bool(getattr(self, "_job_abort_requested", False)):
+            return False
+        active = str(getattr(self, "_active_job_kind", "") or "").strip().upper()
+        asked = str(job_kind or "").strip().upper()
+        return (not asked) or (not active) or active == asked
+
+    def _reset_abort_state(self) -> None:
+        self._job_abort_requested = False
+        self._active_job_kind = ""
+
+    def abort_current_job(self, job_kind: str = "") -> bool:
+        if not self._job_running:
+            messagebox.showinfo("Abort calculation", "There is no running calculation to abort.", parent=self)
+            return False
+
+        active_kind = str(getattr(self, "_active_job_kind", "") or "").strip().upper()
+        asked_kind = str(job_kind or active_kind or "calculation").strip().upper()
+        if active_kind and asked_kind and active_kind != asked_kind:
+            messagebox.showinfo(
+                "Abort calculation",
+                f"A different calculation is currently running ({active_kind}).",
+                parent=self,
+            )
+            return False
+
+        proc = getattr(self, "_active_process", None)
+        if proc is None:
+            messagebox.showinfo("Abort calculation", "No external process is currently attached to this calculation.", parent=self)
+            return False
+
+        label = active_kind or asked_kind or "calculation"
+        if not messagebox.askyesno(
+            "Abort calculation",
+            f"Abort the running {label} calculation?\n\nAny partial output generated so far will be kept in the run folder.",
+            parent=self,
+        ):
+            return False
+
+        self._job_abort_requested = True
+        self.set_status(f"Aborting {label}…")
+        try:
+            self._job_queue.put(("log", f"[{label}] Abort requested by user."))
+        except Exception:
+            pass
+
+        try:
+            proc.terminate()
+        except Exception as e:
+            try:
+                self._job_queue.put(("log", f"[{label}] terminate() failed: {e}"))
+            except Exception:
+                pass
+
+        def _force_kill(expected_proc=proc, expected_label=label):
+            current = getattr(self, "_active_process", None)
+            if current is not expected_proc:
+                return
+            try:
+                if expected_proc.poll() is None:
+                    expected_proc.kill()
+                    try:
+                        self._job_queue.put(("log", f"[{expected_label}] Process still alive after terminate(); kill() sent."))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        try:
+            self.after(2500, _force_kill)
+        except Exception:
+            pass
+        return True
+
+
     def auto_validate_workspace(self):
         """
         Automatic, non-invasive validation:
@@ -2627,6 +4012,9 @@ class App(tk.Tk):
         ctx.f9_candidates = []
         ctx.can_write = False
         ctx.workspace_ok = False
+        ctx.workspace_compute_ok = False
+        ctx.workspace_import_only = False
+        ctx.has_existing_trho = False
         ctx.workspace_msg = "—"
 
         if not p or not p.exists():
@@ -2636,53 +4024,59 @@ class App(tk.Tk):
         fort9 = p / "fort.9"
         ctx.has_fort9 = fort9.exists()
 
-        # 1) candidatos preferenciais: *.f9
+
         f9_candidates = sorted(p.glob("*.f9"))
 
-        # 2) candidatos alternativos: *.9 (exclui fort.9 e também exclui *.f9)
+
         nine_candidates = sorted(
             q for q in p.glob("*.9")
             if q.name != "fort.9" and not q.name.endswith(".f9")
         )
 
-        # guarda tudo em ctx (útil para debug/GUI)
+
         ctx.f9_candidates = f9_candidates + nine_candidates
 
         ctx.can_write = os.access(str(p), os.W_OK)
 
         wf_ok = ctx.has_fort9 or (len(ctx.f9_candidates) >= 1)
 
-        if wf_ok and ctx.can_write:
-            ctx.workspace_ok = True
+
+        self._sync_active_trho_state()
+        existing_trho = self._find_existing_trho_out()
+        ctx.has_existing_trho = existing_trho is not None
+
+        ctx.workspace_compute_ok = bool(wf_ok and ctx.can_write)
+        ctx.workspace_import_only = bool(ctx.has_existing_trho and not wf_ok)
+        ctx.workspace_ok = bool(ctx.workspace_compute_ok or ctx.workspace_import_only)
+
+        if ctx.workspace_compute_ok:
             if ctx.has_fort9:
-                ctx.workspace_msg = "OK ✓ (fort.9 found)"
+                ctx.workspace_msg = "OK ✓ (fort.9 found; TOPOND calculations available)"
             else:
                 if len(ctx.f9_candidates) == 1:
                     ctx.workspace_msg = f"OK ✓ ({ctx.f9_candidates[0].name} found; fort.9 will be prepared on run)"
                 else:
                     ctx.workspace_msg = f"OK ✓ ({len(ctx.f9_candidates)} *.f9/*.9 found; will ask which one on run)"
+        elif ctx.workspace_import_only:
+            ctx.workspace_msg = (
+                "IMPORT-ONLY ✓ (TRHO output found; Reports and CP Viewer available, "
+                "but TOPOND calculations require fort.9 or *.f9/*.9)"
+            )
         else:
             problems = []
             if not wf_ok:
                 problems.append("missing fort.9 and no *.f9/*.9")
+            if not ctx.has_existing_trho:
+                problems.append("no configured TRHO output")
             if not ctx.can_write:
                 problems.append("no write permission")
             ctx.workspace_msg = "NOT OK (" + ", ".join(problems) + ")"
 
-        # Sync active TRHO selection from workspace state (or fallback).
-        self._sync_active_trho_state()
 
-        # Auto-detect existing TRHO output and parse silently (enables Reports immediately),
-        # even if the folder is not suitable for launching a new TRHO run.
-        existing_trho = self._find_existing_trho_out()
         if existing_trho is not None:
-            base_msg = ctx.workspace_msg
-            if not ctx.workspace_ok:
-                ctx.workspace_msg = base_msg + " | existing trho.out found (reports available)"
             self.auto_parse_trho_if_exists()
 
 
-    # ---------- fort.9 preparation (ONLY when TRHO starts) ----------
     def ensure_fort9_for_run(self) -> Tuple[bool, str]:
         """
         Ensures workdir/fort.9 exists.
@@ -2697,10 +4091,10 @@ class App(tk.Tk):
         if fort9.exists():
             return True, "fort.9 found"
 
-        # 1) candidatos preferenciais: *.f9
+
         f9s = sorted(workdir.glob("*.f9"))
 
-        # 2) candidatos alternativos: *.9 (exclui fort.9 e também exclui *.f9)
+
         nines = sorted(
             q for q in workdir.glob("*.9")
             if q.name != "fort.9" and not q.name.endswith(".f9")
@@ -2726,36 +4120,38 @@ class App(tk.Tk):
         else:
             src = candidates[0]
 
-        # Prefer relative symlink fort.9 -> src.name (same folder)
-        try:
-            fort9.symlink_to(src.name)
-            return True, f"created symlink fort.9 -> {src.name}"
-        except Exception:
-            # fallback: copy
-            try:
-                shutil.copy2(src, fort9)
-                return True, f"copied {src.name} -> fort.9"
-            except Exception as e:
-                return False, f"failed to create fort.9 from {src.name}: {e}"
+        return safe_symlink_or_copy(src, fort9)
 
-    # ---------- UI state rules ----------
 
     def _resolve_executable(self, exe: str) -> str:
         """Resolve an executable either as an absolute path or via PATH."""
-        if not exe:
-            return ""
+        resolved = resolve_executable(exe)
+        return str(resolved) if resolved is not None else ""
+
+    def _ensure_properties_executable_ready(self, calculation_name: str = "TOPOND") -> bool:
+        """Check whether the CRYSTAL/TOPOND properties executable is configured and valid.
+
+        This prevents TRHO/TLAP/PL2D/ATBP from starting a run that will inevitably
+        fail because the properties executable was not configured, no longer exists,
+        is not executable, or is a fake/invalid file.
+        """
+        raw = getattr(self.state, "properties_exe", None)
+        ok, kind, msg, resolved = validate_properties_executable(raw)
+        if ok and resolved is not None:
+            self.state.properties_exe = resolved
+            return True
+
+        full_msg = (
+            msg
+            + "\n\nPlease open Settings and define a valid path to the properties executable "
+            + f"before running {calculation_name}."
+        )
         try:
-            p = Path(str(exe))
-            if p.exists():
-                return str(p)
+            self.set_status("properties executable invalid")
         except Exception:
             pass
-        try:
-            import shutil
-            found = shutil.which(str(exe))
-            return found or ""
-        except Exception:
-            return ""
+        messagebox.showwarning("Properties executable required", full_msg, parent=self)
+        return False
 
     def _format_workspace_path(self, full_path: str, *, max_lines: int = 3) -> str:
         """Format the workspace path for the sidebar (stable height, max lines).
@@ -2768,14 +4164,14 @@ class App(tk.Tk):
 
         import textwrap
 
-        # Approximate characters per line for wraplength~220px with default font.
+
         width_chars = 34
 
         wrapped_full = textwrap.wrap(full_path, width=width_chars)
         if len(wrapped_full) <= max_lines:
             return "\n".join(wrapped_full)
 
-        # Otherwise, progressively shorten from the left (keep the tail).
+
         tail_len = min(len(full_path), 140)
         while tail_len > 30:
             candidate = "…" + full_path[-tail_len:]
@@ -2784,7 +4180,7 @@ class App(tk.Tk):
                 return "\n".join(wrapped)
             tail_len -= 5
 
-        # Fallback: hard wrap a minimal tail
+
         candidate = "…" + full_path[-40:]
         wrapped = textwrap.wrap(candidate, width=width_chars)
         return "\n".join(wrapped[:max_lines])
@@ -2821,7 +4217,7 @@ class App(tk.Tk):
     def _tlap_ready(self) -> bool:
         """Return True when TLAP can rely on a valid TRHO result for this workspace."""
         ctx = self.state
-        if not ctx.workspace_ok or self._job_running:
+        if not getattr(ctx, "workspace_compute_ok", False) or self._job_running:
             return False
         return self._ensure_trho_parsed_for_followups()
 
@@ -2829,12 +4225,12 @@ class App(tk.Tk):
         ctx = self.state
         if self._job_running:
             return "TLAP is unavailable while another job is running."
-        if not ctx.workspace_ok:
-            return "TLAP requires a valid workspace first."
+        if not getattr(ctx, "workspace_compute_ok", False):
+            return "TLAP requires fort.9 or a wavefunction file (*.f9/*.9) to run TOPOND calculations."
         if self._find_existing_trho_out() is None:
-            return "TLAP requires a valid TRHO result (trho.out) in this workspace."
+            return "TLAP requires a valid TRHO output in this workspace."
         if not self._ensure_trho_parsed_for_followups():
-            return "TLAP requires a parseable trho.out in this workspace."
+            return "TLAP requires a parseable TRHO output in this workspace."
         return ""
 
     def _cp_viewer_ready(self) -> bool:
@@ -2855,20 +4251,37 @@ class App(tk.Tk):
         if ctx.workspace_dir is None:
             return "CP Viewer requires a workspace first."
         if self._find_existing_trho_out() is None:
-            return "CP Viewer requires a valid TRHO result (trho.out) in this workspace."
+            return "CP Viewer requires a valid TRHO output in this workspace."
         if not self._ensure_trho_parsed_for_followups():
-            return "CP Viewer requires a parseable trho.out in this workspace."
+            return "CP Viewer requires a parseable TRHO output in this workspace."
         return ""
 
+    def _schedule_refresh_ui_state(self):
+        """Schedule one periodic UI refresh callback.
+
+        Several actions can request an immediate refresh.  On macOS, if each
+        request also leaves its own periodic after() callback behind, the app can
+        look like it is stuck/busy after closing secondary windows.  This helper
+        centralizes scheduling and prevents duplicate refresh loops.
+        """
+        try:
+            old_id = getattr(self, "_refresh_ui_after_id", None)
+            if old_id is not None:
+                try:
+                    self.after_cancel(old_id)
+                except Exception:
+                    pass
+            self._refresh_ui_after_id = self.after(self._ui_refresh_ms, self.refresh_ui_state)
+        except Exception:
+            self._refresh_ui_after_id = None
+
     def refresh_ui_state(self):
+
+            self._refresh_ui_after_id = None
             ctx = self.state
 
             full_ws = str(ctx.workspace_dir) if ctx.workspace_dir else ""
-
-            self.lbl_workspace.config(text=self._format_workspace_path(full_ws) if full_ws else "No workspace selected")
-            if hasattr(self, "_ws_tooltip"):
-                self._ws_tooltip.update_text(full_ws if full_ws else "")
-            self.status_var.set(ctx.status)
+            ws_label = self._format_workspace_path(full_ws) if full_ws else "No workspace selected"
 
             bits = []
             if ctx.workspace_dir:
@@ -2888,55 +4301,91 @@ class App(tk.Tk):
                 bits.append("write ✓")
             if ctx.trho_done:
                 bits.append("TRHO ✓")
-            self.lbl_bits.config(text=" | ".join(bits) if bits else "—")
+            bits_text = " | ".join(bits) if bits else "—"
 
-            rules: Dict[str, Callable[[], bool]] = {
-                "Workspace": lambda: True,
-                "Compute": lambda: ctx.workspace_ok,
-                "TLAP": lambda: self._tlap_ready(),
-                "CP Viewer": lambda: self._cp_viewer_ready(),
-                "PL2D": lambda: ctx.workspace_ok and ctx.trho_done and (not self._job_running),
-                # PL2D Viewer must work even when TRHO prerequisites are missing
-                # (e.g., user selects an already computed PL2D run folder with sliceXXX).
-                "PL2D Viewer": lambda: (ctx.workspace_dir is not None) and self._has_any_pl2d_runs() and (not self._job_running),
-                "ATBP": lambda: ctx.workspace_ok and ctx.trho_done and (not self._job_running),
-                "BCP Evaluation": lambda: ctx.trho_done and (getattr(ctx, "trho_parsed", None) is not None) and (getattr(getattr(ctx, "trho_parsed", None), "df_bcp_props", None) is not None) and (not getattr(ctx.trho_parsed, "df_bcp_props").empty) and (not self._job_running),
-                "Reports": lambda: ctx.trho_done,
+            tlap_ready = self._tlap_ready()
+            cpv_ready = self._cp_viewer_ready()
+            has_pl2d_runs = self._has_any_pl2d_runs()
+            bcp_ready = (
+                ctx.trho_done
+                and (getattr(ctx, "trho_parsed", None) is not None)
+                and (getattr(getattr(ctx, "trho_parsed", None), "df_bcp_props", None) is not None)
+                and (not getattr(ctx.trho_parsed, "df_bcp_props").empty)
+            )
+
+            compute_ok = bool(getattr(ctx, "workspace_compute_ok", False))
+            import_only = bool(getattr(ctx, "workspace_import_only", False))
+            rules_enabled = {
+                "Workspace": True,
+
+
+                "Compute": ctx.workspace_ok,
+                "TLAP": tlap_ready,
+                "CP Viewer": cpv_ready,
+                "PL2D": compute_ok and ctx.trho_done and (not self._job_running),
+                "PL2D Viewer": (ctx.workspace_dir is not None) and has_pl2d_runs and (not self._job_running),
+                "ATBP": compute_ok and ctx.trho_done and (not self._job_running),
+                "BCP Evaluation": bcp_ready and (not self._job_running),
+                "Reports": ctx.trho_done,
             }
             badges = {
                 "Workspace": "✓" if ctx.workspace_ok else ("!" if ctx.workspace_dir else "!"),
-                "Compute": "✓" if ctx.trho_done else ("!" if ctx.workspace_ok else "🔒"),
-                "TLAP": "!" if self._tlap_ready() else ("!" if ctx.workspace_ok else "🔒"),
-                "CP Viewer": "✓" if self._cp_viewer_ready() else ("!" if ctx.workspace_dir else "🔒"),
-                "PL2D": "✓" if getattr(ctx, "pl2d_run_dir", None) else ("!" if ctx.trho_done else "🔒"),
-                # PL2D Viewer should NOT depend on fort.9/TRHO prerequisites; it only needs a folder with runs.
-                "PL2D Viewer": "✓" if self._has_any_pl2d_runs() else ("!" if ctx.workspace_dir else "🔒"),
-                "ATBP": "✓" if getattr(ctx, "atbp_out_path", None) else ("!" if (ctx.workspace_ok and ctx.trho_done) else "🔒"),
-                "BCP Evaluation": "✓" if (ctx.trho_done and (getattr(ctx, "trho_parsed", None) is not None) and (getattr(getattr(ctx, "trho_parsed", None), "df_bcp_props", None) is not None) and (not getattr(ctx.trho_parsed, "df_bcp_props").empty)) else ("!" if ctx.workspace_ok else "🔒"),
+                "Compute": "✓" if ctx.trho_done else ("!" if compute_ok else ("🔒" if not import_only else "!")),
+                "TLAP": "!" if tlap_ready else ("🔒" if not compute_ok else "!"),
+                "CP Viewer": "✓" if cpv_ready else ("!" if ctx.workspace_dir else "🔒"),
+                "PL2D": "✓" if getattr(ctx, "pl2d_run_dir", None) else ("!" if (compute_ok and ctx.trho_done) else "🔒"),
+                "PL2D Viewer": "✓" if has_pl2d_runs else ("!" if ctx.workspace_dir else "🔒"),
+                "ATBP": "✓" if getattr(ctx, "atbp_out_path", None) else ("!" if (compute_ok and ctx.trho_done) else "🔒"),
+                "BCP Evaluation": "✓" if bcp_ready else ("!" if ctx.workspace_ok else "🔒"),
                 "Reports": "✓" if ctx.trho_done else "🔒",
             }
 
-            for key, btn in self.nav_buttons.items():
-                enabled = rules.get(key, lambda: True)()
-                btn.state(["!disabled"] if enabled else ["disabled"])
-                self.nav_badges[key].config(text=badges.get(key, " "))
-                if key == "TLAP":
-                    tip = "" if enabled else self._tlap_tooltip_text()
-                    try:
-                        self.nav_tooltips[key].update_text(tip)
-                    except Exception:
-                        pass
-                elif key == "CP Viewer":
-                    tip = "" if enabled else self._cp_viewer_tooltip_text()
-                    try:
-                        self.nav_tooltips[key].update_text(tip)
-                    except Exception:
-                        pass
+            snapshot = (
+                ws_label,
+                full_ws,
+                ctx.status,
+                bits_text,
+                tuple((k, rules_enabled.get(k, True), badges.get(k, " ")) for _, k in self.nav_items),
+            )
+            force = snapshot != self._last_ui_snapshot
 
-            for p in self.pages.values():
-                p.refresh_state()
+            if force:
+                self.lbl_workspace.config(text=ws_label)
+                if hasattr(self, "_ws_tooltip"):
+                    self._ws_tooltip.update_text(full_ws if full_ws else "")
+                self.status_var.set(ctx.status)
+                self.lbl_bits.config(text=bits_text)
 
-            self.after(250, self.refresh_ui_state)
+                for _, key in self.nav_items:
+                    btn = self.nav_buttons[key]
+                    enabled = rules_enabled.get(key, True)
+                    btn.state(["!disabled"] if enabled else ["disabled"])
+                    self.nav_badges[key].config(text=badges.get(key, " "))
+                    if key == "TLAP":
+                        tip = "" if enabled else self._tlap_tooltip_text()
+                        try:
+                            self.nav_tooltips[key].update_text(tip)
+                        except Exception:
+                            pass
+                    elif key == "CP Viewer":
+                        tip = "" if enabled else self._cp_viewer_tooltip_text()
+                        try:
+                            self.nav_tooltips[key].update_text(tip)
+                        except Exception:
+                            pass
+                self._last_ui_snapshot = snapshot
+
+
+            current_page = getattr(self, "_current_page", None)
+            if current_page is not None:
+                try:
+                    refresh_state = getattr(current_page, "refresh_state", None)
+                    if callable(refresh_state):
+                        refresh_state()
+                except Exception:
+                    pass
+
+            self._schedule_refresh_ui_state()
 
     def _has_any_pl2d_runs(self) -> bool:
         """Return True if we can find at least one PL2D run.
@@ -2950,7 +4399,7 @@ class App(tk.Tk):
         if not ws:
             return False
 
-        # If user selected a single run directory directly
+
         if (ws / "slice000").exists():
             return True
 
@@ -2969,19 +4418,81 @@ class App(tk.Tk):
                 continue
         return False
 
-    # ---------- Job runner ----------
 
     def refresh_all_pages(self):
-        """Refresh navigation badges and page widgets after state changes."""
+        """Refresh navigation badges and the currently visible page after state changes."""
         self._sync_active_trho_state()
         self._sync_active_tlap_state()
+
+        self._last_ui_snapshot = None
         self.refresh_ui_state()
-        for p in self.pages.values():
-            if hasattr(p, "refresh"):
-                try:
-                    p.refresh()
-                except Exception:
-                    pass
+        current_page = getattr(self, "_current_page", None)
+        if current_page is not None and hasattr(current_page, "refresh"):
+            try:
+                current_page.refresh()
+            except Exception:
+                pass
+
+    def re_scan_external_results_after_settings_change(self) -> None:
+        """Re-scan the current workspace after output-name settings change.
+
+        This is needed when the user adds a new accepted external result name
+        (for example *.outp) while the workspace is already open.
+        """
+        ctx = self.state
+        if not getattr(ctx, "workspace_dir", None):
+            self.refresh_all_pages()
+            return
+
+
+        ctx.trho_done = False
+        ctx.trho_parsed = None
+        ctx.trho_parse_error = None
+        ctx.trho_parse_attempted_out = ""
+        ctx.trho_output_issue = None
+        try:
+            ctx.df_bcp_props = None
+            ctx.df_true_atoms = None
+        except Exception:
+            pass
+
+        ctx.tlap_done = False
+        ctx.tlap_parsed = None
+        ctx.tlap_parse_error = None
+        ctx.tlap_parse_attempted_out = ""
+
+        try:
+            ctx.df_atbp = None
+        except Exception:
+            pass
+        ctx.atbp_out_path = None
+        ctx.atbp_run_dir = None
+
+
+        self._sync_active_trho_state()
+        self._sync_active_tlap_state()
+        try:
+            self.auto_validate_workspace()
+        except Exception:
+            pass
+
+
+        try:
+            self._sync_active_tlap_state()
+            if self._find_active_tlap_out() is not None:
+                self.ensure_active_tlap_parsed()
+        except Exception:
+            pass
+
+
+        try:
+            atbp_run = self._get_active_atbp_dir()
+            ctx.atbp_run_dir = atbp_run
+            ctx.atbp_out_path = self._find_active_atbp_out()
+        except Exception:
+            pass
+
+        self.refresh_all_pages()
 
     def _load_workspace_state(self) -> dict:
         path = _workspace_state_path(self.state)
@@ -3002,7 +4513,7 @@ class App(tk.Tk):
         runs = []
         try:
             for p in sorted(root.iterdir()):
-                if p.is_dir() and (p / "trho.out").exists():
+                if p.is_dir() and self._find_matching_output_in_dirs([p], self._configured_output_names("trho")) is not None:
                     runs.append(p)
         except Exception:
             pass
@@ -3105,20 +4616,29 @@ class App(tk.Tk):
         state = self._load_workspace_state()
         rel = str(state.get("active_trho") or "").strip()
         ws = getattr(self.state, "workspace_dir", None)
+        names = self._configured_output_names("trho")
         if ws and rel:
             p = (ws / rel).resolve()
             try:
-                if p.exists() and (p / "trho.out").exists():
+                if p.exists() and self._find_matching_output_in_dirs([p], names) is not None:
                     return p
             except Exception:
                 pass
         runs = self._list_trho_run_dirs()
         if runs:
             return runs[0]
-        # legacy fallback
+
+
+        if ws is not None:
+            try:
+                if self._find_matching_output_in_dirs([ws], names) is not None:
+                    return Path(ws)
+            except Exception:
+                pass
+
         if ws is not None:
             legacy = ws / "trho"
-            if legacy.exists() and (legacy / "trho.out").exists():
+            if legacy.exists() and self._find_matching_output_in_dirs([legacy], names) is not None:
                 return legacy
         return None
 
@@ -3383,40 +4903,67 @@ class App(tk.Tk):
             meta["iauto"] = cfg.get("IAUTO")
         return meta
 
-    def _find_existing_trho_out(self) -> Optional[Path]:
-        """Return the best existing trho.out candidate for the current workspace.
+    def _configured_output_names(self, kind: str) -> List[str]:
+        key = f"{str(kind or '').strip().lower()}_output_names"
+        defaults = {
+            "trho_output_names": DEFAULT_TRHO_OUTPUT_NAMES,
+            "tlap_output_names": DEFAULT_TLAP_OUTPUT_NAMES,
+            "atbp_output_names": DEFAULT_ATBP_OUTPUT_NAMES,
+        }
+        return parse_output_name_list(self._settings.get(key), defaults.get(key, []))
 
-        Preference order:
-        1) active TRHO run (if any)
-        2) legacy layouts:
-           - <workspace>/trho.out
-           - <workspace>/trho/trho.out
-        """
+    def _find_matching_output_in_dirs(self, base_dirs, accepted_names: List[str]) -> Optional[Path]:
+        names = parse_output_name_list(accepted_names, [])
+        if not names:
+            return None
+        if isinstance(base_dirs, (str, os.PathLike, Path)):
+            base_dirs = [base_dirs]
+        for base in (base_dirs or []):
+            if base is None:
+                continue
+            try:
+                b = Path(base)
+            except Exception:
+                continue
+            try:
+                if not b.exists():
+                    continue
+            except Exception:
+                continue
+            for name in names:
+                cand = b / name
+                try:
+                    if cand.exists() and cand.is_file():
+                        return cand
+                except Exception:
+                    pass
+        return None
+
+    def _preferred_output_name(self, kind: str, fallback: str) -> str:
+        names = self._configured_output_names(kind)
+        return names[0] if names else fallback
+
+    def _find_existing_trho_out(self) -> Optional[Path]:
+        """Return the best existing TRHO output candidate for the current workspace."""
         ctx = self.state
         ws = getattr(ctx, "workspace_dir", None)
         if not ws:
             return None
 
+        names = self._configured_output_names("trho")
+
         active_dir = self._get_active_trho_dir()
         if active_dir is not None:
-            try:
-                active_out = active_dir / "trho.out"
-                if active_out.exists() and active_out.is_file():
-                    return active_out
-            except Exception:
-                pass
+            found = self._find_matching_output_in_dirs([active_dir], names)
+            if found is not None:
+                return found
 
         candidates = [
-            ws / "trho.out",
-            ws / "trho" / "trho.out",
+            ws,
+            ws / "trho",
+            ws / "trho_runs",
         ]
-        for cand in candidates:
-            try:
-                if cand.exists() and cand.is_file():
-                    return cand
-            except Exception:
-                pass
-        return None
+        return self._find_matching_output_in_dirs(candidates, names)
 
     def build_trho_command(self) -> List[str]:
         """
@@ -3430,8 +4977,7 @@ class App(tk.Tk):
         run_dir = self._get_active_tlap_dir()
         if run_dir is None:
             return None
-        cand = Path(run_dir) / "tlap.out"
-        return cand if cand.exists() else None
+        return self._find_matching_output_in_dirs([Path(run_dir)], self._configured_output_names("tlap"))
 
     def ensure_active_tlap_parsed(self) -> bool:
         out_path = self._find_active_tlap_out()
@@ -3464,9 +5010,7 @@ class App(tk.Tk):
     def auto_parse_trho_if_exists(self):
         """If an existing trho.out is found, parse it silently and enable Reports.
 
-        Accepted locations:
-        - <workspace>/trho.out
-        - <workspace>/trho/trho.out
+        Accepted locations follow the configured TRHO output names in Settings.
         """
         ctx = self.state
         if not ctx.workspace_dir:
@@ -3485,15 +5029,40 @@ class App(tk.Tk):
 
         try:
             ctx.trho_parse_attempted_out = out_key
+            issue = detect_trho_output_issue(out_path)
+            if issue is not None:
+                ctx.trho_parsed = None
+                ctx.trho_done = True
+                ctx.trho_output_issue = issue
+                ctx.trho_parse_error = issue.get("message", issue.get("title", "TRHO output issue"))
+                log_event(ctx, f'TRHO output issue detected: {issue.get("kind", "unknown")} in {out_path}')
+                try:
+                    rel = out_path.relative_to(Path(ctx.workspace_dir))
+                except Exception:
+                    rel = out_path
+                self.set_status(f"TRHO failed ({issue.get('kind', 'output issue')}): {rel}")
+                self.refresh_all_pages()
+                return
             parsed = parse_trho_out(
                 out_path,
                 open_shell=getattr(self.state, "open_shell", False),
                 slab_2d=getattr(self.state, "slab_2d", False),
                 nna_cutoff_ang=float(getattr(self.state, "nna_cutoff_ang", 0.35) or 0.35),
             )
+            issue = detect_trho_output_issue(out_path, parsed)
+            if issue is not None:
+                ctx.trho_parsed = None
+                ctx.trho_done = True
+                ctx.trho_output_issue = issue
+                ctx.trho_parse_error = issue.get("message", issue.get("title", "TRHO output issue"))
+                log_event(ctx, f'TRHO output issue detected after parsing: {issue.get("kind", "unknown")} in {out_path}')
+                self.set_status(f"TRHO failed ({issue.get('kind', 'output issue')})")
+                self.refresh_all_pages()
+                return
             ctx.trho_parsed = parsed
             ctx.trho_done = True
             ctx.trho_parse_error = None
+            ctx.trho_output_issue = None
             log_event(ctx, f'TRHO existing auto-parsed: {out_path}')
             try:
                 ctx.df_bcp_props = parsed.df_bcp_props.copy()
@@ -3518,7 +5087,6 @@ class App(tk.Tk):
         self.refresh_all_pages()
 
 
-
     def parse_existing_trho(self):
         """Teste parcial A: parsear um TRHO já existente (trho/trho.out) sem rodar o properties."""
         ctx = self.state
@@ -3527,19 +5095,50 @@ class App(tk.Tk):
             return
 
         out_path = self._find_existing_trho_out()
-        if out_path is None or not out_path.exists():
-            messagebox.showwarning("TRHO", "trho.out not found in workspace root or workspace/trho/.")
+        if out_path is None:
+            messagebox.showwarning(
+                "TRHO",
+                "No configured TRHO output file was found in the workspace root, "
+                "workspace/trho/, workspace/trho_runs/, or inside "
+                "workspace/trho_runs/<run_name>/."
+            )
             return
 
         try:
+            issue = detect_trho_output_issue(out_path)
+            if issue is not None:
+                ctx.trho_parsed = None
+                ctx.trho_done = True
+                ctx.trho_output_issue = issue
+                ctx.trho_parse_error = issue.get("message", issue.get("title", "TRHO output issue"))
+                self._job_queue.put(("log", f"[TRHO] output issue: {issue.get('title', issue.get('kind', 'output issue'))}"))
+                self._job_queue.put(("parse_error", ctx.trho_parse_error))
+                self.set_status(f"TRHO failed ({issue.get('kind', 'output issue')})")
+                messagebox.showerror("TRHO output issue", ctx.trho_parse_error, parent=self)
+                self.refresh_all_pages()
+                return
             parsed = parse_trho_out(
                 out_path,
                 open_shell=getattr(self.state, "open_shell", False),
                 slab_2d=getattr(self.state, "slab_2d", False),
                 nna_cutoff_ang=float(getattr(self.state, "nna_cutoff_ang", 0.35) or 0.35),
             )
+            issue = detect_trho_output_issue(out_path, parsed)
+            if issue is not None:
+                ctx.trho_parsed = None
+                ctx.trho_done = True
+                ctx.trho_output_issue = issue
+                ctx.trho_parse_error = issue.get("message", issue.get("title", "TRHO output issue"))
+                self._job_queue.put(("log", f"[TRHO] output issue: {issue.get('title', issue.get('kind', 'output issue'))}"))
+                self._job_queue.put(("parse_error", ctx.trho_parse_error))
+                self.set_status(f"TRHO failed ({issue.get('kind', 'output issue')})")
+                messagebox.showerror("TRHO output issue", ctx.trho_parse_error, parent=self)
+                self.refresh_all_pages()
+                return
             ctx.trho_parsed = parsed
             ctx.trho_done = True
+            ctx.trho_output_issue = None
+            ctx.trho_parse_error = None
             log_event(ctx, 'TRHO finished OK')
             ctx.df_bcp_props = parsed.df_bcp_props
             ctx.df_true_atoms = parsed.df_true_atoms
@@ -3549,11 +5148,10 @@ class App(tk.Tk):
             self._job_queue.put(("log", "[TRHO] " + summary))
             self._sync_active_trho_state()
             self.set_status("✔ TRHO parsed (existing trho.out)")
-            # Non-blocking: details are available in the log panel.
-            
+
 
         except Exception as e:
-            # TRHO output exists, but parsing failed (keep app usable and explain in Reports).
+
             ctx.trho_parsed = None
             ctx.trho_done = True
             ctx.trho_parse_error = str(e)
@@ -3568,8 +5166,15 @@ class App(tk.Tk):
 
         ctx = self.state
         log_event(ctx, 'TRHO started')
-        if not ctx.workspace_ok or not ctx.workspace_dir:
-            messagebox.showwarning("TRHO", "Workspace is not valid. Choose a folder with fort.9 or *.f9 and write permission.")
+        if not getattr(ctx, "workspace_compute_ok", False) or not ctx.workspace_dir:
+            messagebox.showwarning(
+                "TRHO",
+                "This workspace is import-only. Reports and CP Viewer are available from the imported TRHO output. "
+                "Running TOPOND calculations requires fort.9 or a wavefunction file (.f9/.9) and write permission in the workspace directory."
+            )
+            return
+
+        if not self._ensure_properties_executable_ready("TRHO"):
             return
 
         if not messagebox.askyesno(
@@ -3578,13 +5183,13 @@ class App(tk.Tk):
         ):
             return
 
-        # Create/link fort.9 ONLY now (right before running).
+
         ok, msg = self.ensure_fort9_for_run()
         if not ok:
             messagebox.showerror("TRHO", msg)
             return
         self._job_queue.put(("log", f"[Workspace] {msg}"))
-        self.auto_validate_workspace()  # refresh detection; fort.9 should exist now
+        self.auto_validate_workspace()
 
         self._job_running = True
         ctx.trho_done = False
@@ -3596,7 +5201,7 @@ class App(tk.Tk):
         except Exception:
             pass
 
-        # Keep the bottom status bar free of redundant TRHO task text; the Compute page has its own progress UI.
+
         self.set_task(active=False)
 
         self.set_status("Running TRHO…")
@@ -3631,30 +5236,28 @@ class App(tk.Tk):
                 trho_dir = self.prepare_trho_folder()
                 inp_path = self.write_trho_input(trho_dir)
                 out_path = trho_dir / "trho.out"
+                try:
+                    meta = self._build_trho_run_metadata(trho_dir, trho_cfg)
+                    meta["status"] = "running"
+                    _write_json_file(trho_dir / "run.json", meta)
+                except Exception:
+                    pass
 
                 exe = self.state.properties_exe
                 exe_str = str(exe) if exe is not None else ""
-                exe_resolved = None
-                try:
-                    import shutil, os
-                    # Allow either absolute path or command available in PATH.
-                    if exe_str and (os.path.isabs(exe_str) or "/" in exe_str):
-                        exe_resolved = exe_str if Path(exe_str).exists() else None
-                    else:
-                        exe_resolved = shutil.which(exe_str) if exe_str else None
-                except Exception:
-                    exe_resolved = exe_str if exe_str else None
+                exe_path = _best_effort_make_executable(exe_str)
+                exe_resolved = str(exe_path) if exe_path is not None else ""
 
                 if not exe_resolved:
                     self._job_queue.put(("error", f"properties executable not found (configure it in Settings): {exe_str!r}"))
                     return
 
-                # Record execution metadata (for Execution Details)
+
                 import time as _time
                 _t0 = _time.time()
                 self.state.last_execution = {"command": [exe_resolved], "cwd": str(trho_dir), "exit_code": None, "duration_s": None}
 
-                # Run properties by feeding TRHO input via stdin and capturing combined stdout/stderr.
+
                 self._job_queue.put(("log", f"[TRHO] cwd: {trho_dir}"))
                 self._job_queue.put(("log", f"[TRHO] exe: {exe_resolved}"))
                 self._job_queue.put(("log", f"[TRHO] inp: {inp_path.name}"))
@@ -3670,12 +5273,14 @@ class App(tk.Tk):
                         text=True,
                         bufsize=1,
                         universal_newlines=True,
+                        **_windows_subprocess_silent_kwargs(),
                     )
+                    self._register_active_process(p, "TRHO")
 
-                    # progresso indeterminado (até você ter métrica real)
+
                     self._job_queue.put(("progress", 0, 0))
 
-                    # stream de saída pro log
+
                     for line in p.stdout:
                         self._job_queue.put(("log", line.rstrip("\n")))
                         fout.write(line)
@@ -3683,6 +5288,7 @@ class App(tk.Tk):
                     p.wait()
 
                     rc = p.returncode
+                    self._clear_active_process(p)
                     self._cleanup_run_temp_files(trho_dir, "TRHO")
                     try:
                         _t1 = _time.time()
@@ -3692,11 +5298,30 @@ class App(tk.Tk):
                     except Exception:
                         pass
                     if rc == 0 and out_path.exists():
-                        # TRHO finished successfully (exit code 0). Parsing may still fail depending on output format.
+
+
+                        issue = detect_trho_output_issue(out_path)
+                        if issue is not None:
+                            self.state.trho_parsed = None
+                            self.state.trho_done = True
+                            self.state.trho_output_issue = issue
+                            self.state.trho_parse_error = issue.get("message", issue.get("title", "TRHO output issue"))
+                            try:
+                                meta = self._build_trho_run_metadata(trho_dir, trho_cfg)
+                                meta["status"] = "failed"
+                                meta["failure_kind"] = issue.get("kind", "output_issue")
+                                meta["failure_reason"] = self.state.trho_parse_error
+                                _write_json_file(trho_dir / "run.json", meta)
+                            except Exception:
+                                pass
+                            self._job_queue.put(("trho_issue", issue, str(trho_dir)))
+                            return
+
                         self.state.trho_done = True
                         self.state.trho_parse_error = None
+                        self.state.trho_output_issue = None
                         try:
-                            # >>> AQUI ENTRA O PARSER <<<
+
                             parsed = parse_trho_out(
                                 out_path,
                                 open_shell=getattr(self.state, "open_shell", False),
@@ -3704,11 +5329,29 @@ class App(tk.Tk):
                                 nna_cutoff_ang=float(getattr(self.state, "nna_cutoff_ang", 0.35) or 0.35),
                             )
 
-                            # guardar no contexto (sem globals)
+                            issue = detect_trho_output_issue(out_path, parsed)
+                            if issue is not None:
+                                self.state.trho_parsed = None
+                                self.state.trho_done = True
+                                self.state.trho_output_issue = issue
+                                self.state.trho_parse_error = issue.get("message", issue.get("title", "TRHO output issue"))
+                                try:
+                                    meta = self._build_trho_run_metadata(trho_dir, trho_cfg)
+                                    meta["status"] = "failed"
+                                    meta["failure_kind"] = issue.get("kind", "output_issue")
+                                    meta["failure_reason"] = self.state.trho_parse_error
+                                    _write_json_file(trho_dir / "run.json", meta)
+                                except Exception:
+                                    pass
+                                self._job_queue.put(("trho_issue", issue, str(trho_dir)))
+                                return
+
+
                             self.state.trho_parsed = parsed
                             self.state.trho_done = True
+                            self.state.trho_output_issue = None
 
-                            # opcional: guardar atalhos
+
                             self.state.df_bcp_props = parsed.df_bcp_props
                             self.state.df_true_atoms = parsed.df_true_atoms
 
@@ -3720,7 +5363,7 @@ class App(tk.Tk):
                             self._job_queue.put(("trho_run_ready", str(trho_dir), self._friendly_trho_run_label(trho_dir)))
 
                         except Exception as e:
-                            # TRHO ran (rc=0), but parsing failed. Keep TRHO as done and expose error in Reports.
+
                             self.state.trho_parsed = None
                             self.state.trho_done = True
                             self.state.trho_parse_error = str(e)
@@ -3731,6 +5374,7 @@ class App(tk.Tk):
 
 
             except Exception as e:
+                self._clear_active_process()
                 self._job_queue.put(("error", str(e)))
 
         self._job_thread = threading.Thread(target=worker, daemon=True)
@@ -3743,8 +5387,15 @@ class App(tk.Tk):
             return
 
         ctx = self.state
-        if not ctx.workspace_ok or not ctx.workspace_dir:
-            messagebox.showwarning("TLAP", "Workspace is not valid. Choose a folder with fort.9 or *.f9 and write permission.")
+        if not getattr(ctx, "workspace_compute_ok", False) or not ctx.workspace_dir:
+            messagebox.showwarning(
+                "TLAP",
+                "This workspace is import-only. To run TLAP, provide fort.9 or a wavefunction file (*.f9/*.9) "
+                        "and ensure that the workspace directory is writable."
+            )
+            return
+
+        if not self._ensure_properties_executable_ready("TLAP"):
             return
 
         ok, msg = self.ensure_fort9_for_run()
@@ -3791,7 +5442,7 @@ class App(tk.Tk):
                 import subprocess
                 out_path = tlap_dir / "tlap.out"
                 exe = self.state.properties_exe
-                exe_path = self._resolve_executable(str(exe))
+                exe_path = str(_best_effort_make_executable(exe) or "")
                 if not exe_path:
                     self._job_queue.put(("tlap_fail", f"properties executable not found: {exe}", str(tlap_dir)))
                     return
@@ -3811,7 +5462,9 @@ class App(tk.Tk):
                         text=True,
                         bufsize=1,
                         universal_newlines=True,
+                        **_windows_subprocess_silent_kwargs(),
                     )
+                    self._register_active_process(p, "TLAP")
 
                     for line in p.stdout:
                         self._job_queue.put(("log", line.rstrip("\n")))
@@ -3819,6 +5472,7 @@ class App(tk.Tk):
 
                     p.wait()
                     rc = p.returncode
+                    self._clear_active_process(p)
                     self._cleanup_run_temp_files(tlap_dir, "TLAP")
                     label = self._friendly_tlap_run_label(tlap_dir)
                     if rc == 0 and out_path.exists():
@@ -3826,6 +5480,7 @@ class App(tk.Tk):
                     else:
                         self._job_queue.put(("tlap_fail", f"TLAP failed (rc={rc})", str(tlap_dir)))
             except Exception as e:
+                self._clear_active_process()
                 self._job_queue.put(("tlap_fail", str(e), str(tlap_dir)))
 
         self._job_thread = threading.Thread(target=worker, daemon=True)
@@ -3842,12 +5497,12 @@ class App(tk.Tk):
 
                 elif kind == "progress":
                     done, total = item[1], item[2]
-                    # TRHO uses the page-local progress bar; avoid duplicating task text in the bottom status bar.
+
                     self.set_task(active=False)
 
                 elif kind == "pl2d_progress":
                     done, total, msg = item[1], item[2], item[3]
-                    # Update page-local progress bar if page exists
+
                     try:
                         p = self.pages.get("PL2D")
                         if p is not None and hasattr(p, "pb"):
@@ -3862,25 +5517,37 @@ class App(tk.Tk):
                 elif kind == "pl2d_done":
                     run_dir = item[1]
                     self.state.pl2d_run_dir = Path(run_dir) if run_dir else None
+                    self._clear_active_process()
+                    self._active_job_kind = ""
                     try:
                         p = self.pages.get("PL2D")
                         if p is not None:
-                            if hasattr(p, "on_atbp_done"):
-                                p.on_atbp_done(out_path)
                             p.lbl_status.configure(text="✔ PL2D finished")
                             p.btn_run.configure(state="normal")
+                            if hasattr(p, "btn_export_campaign"):
+                                p.btn_export_campaign.configure(state="normal")
                             if hasattr(p, "lbl_pb"):
                                 p.lbl_pb.configure(text="Done.")
+                            if hasattr(p, "pb"):
+                                try:
+                                    p.pb["value"] = p.pb.cget("maximum")
+                                except Exception:
+                                    pass
                     except Exception:
                         pass
                     self._job_running = False
+                    self.state.pl2d_running = False
                     self.set_task(active=False)
                     self.set_status("PL2D finished ✓")
                     self.task_log("[PL2D] finished OK")
+                    self.refresh_all_pages()
 
                 elif kind == "pl2d_fail":
                     msg, run_dir = item[1], item[2]
+                    self._clear_active_process()
+                    self._active_job_kind = ""
                     self._job_running = False
+                    self.state.pl2d_running = False
                     self.set_task(active=False)
                     self.set_status("PL2D failed")
                     self.task_log("[PL2D] failed: " + str(msg))
@@ -3888,11 +5555,14 @@ class App(tk.Tk):
                         p = self.pages.get("PL2D")
                         if p is not None:
                             p.btn_run.configure(state="normal")
+                            if hasattr(p, "btn_export_campaign"):
+                                p.btn_export_campaign.configure(state="normal")
                             p.lbl_status.configure(text="▶ PL2D not run")
                             if hasattr(p, "lbl_pb"):
                                 p.lbl_pb.configure(text="Failed.")
                     except Exception:
                         pass
+                    self.refresh_all_pages()
                     messagebox.showerror("PL2D", str(msg))
 
                 elif kind == "tlap_done":
@@ -3901,13 +5571,17 @@ class App(tk.Tk):
                     self.state.tlap_done = True
                     self.state.tlap_parse_error = None
                     self.set_task(active=False)
-                    self.set_status("TLAP finished ✓")
-                    self.task_log("[TLAP] finished OK")
+                    if self._job_was_aborted("TLAP"):
+                        self.set_status("TLAP aborted")
+                        self.task_log("[TLAP] aborted by user")
+                    else:
+                        self.set_status("TLAP finished ✓")
+                        self.task_log("[TLAP] finished OK")
 
                     run_dir_p = Path(run_dir)
                     try:
                         meta = self._read_tlap_run_meta(run_dir_p)
-                        meta["status"] = "finished"
+                        meta["status"] = "aborted" if self._job_was_aborted("TLAP") else "finished"
                         _write_json_file(run_dir_p / "run.json", meta)
                     except Exception:
                         pass
@@ -3944,10 +5618,11 @@ class App(tk.Tk):
                             if hasattr(p, "_set_running"):
                                 p._set_running(False)
                             if hasattr(p, "set_completion_text"):
-                                p.set_completion_text("TLAP completed ✓")
+                                p.set_completion_text("TLAP aborted" if self._job_was_aborted("TLAP") else "TLAP completed ✓")
                     except Exception:
                         pass
                     self.state.pending_tlap_run_name = ""
+                    self._reset_abort_state()
                     self.refresh_all_pages()
 
                 elif kind == "tlap_fail":
@@ -3955,12 +5630,13 @@ class App(tk.Tk):
                     self._job_running = False
                     self.state.tlap_done = False
                     self.set_task(active=False)
-                    self.set_status("TLAP failed")
-                    self.task_log("[TLAP] failed: " + str(msg))
+                    aborted = self._job_was_aborted("TLAP")
+                    self.set_status("TLAP aborted" if aborted else "TLAP failed")
+                    self.task_log(("[TLAP] aborted by user" if aborted else "[TLAP] failed: " + str(msg)))
                     try:
                         run_dir_p = Path(run_dir)
                         meta = self._read_tlap_run_meta(run_dir_p)
-                        meta["status"] = "failed"
+                        meta["status"] = "aborted" if aborted else "failed"
                         _write_json_file(run_dir_p / "run.json", meta)
                     except Exception:
                         pass
@@ -3970,28 +5646,45 @@ class App(tk.Tk):
                             if hasattr(p, "_set_running"):
                                 p._set_running(False)
                             if hasattr(p, "set_completion_text"):
-                                p.set_completion_text("TLAP failed ✖")
+                                p.set_completion_text("TLAP aborted" if aborted else "TLAP failed ✖")
                     except Exception:
                         pass
                     self.state.pending_tlap_run_name = ""
+                    self._reset_abort_state()
                     self.refresh_all_pages()
-                    messagebox.showerror("TLAP", str(msg))
+                    if not aborted:
+                        messagebox.showerror("TLAP", str(msg))
 
-                # -----------------------------
-                # ATBP job events
-                # -----------------------------
+
                 elif kind == "atbp_done":
                     out_path, run_dir = item[1], item[2]
                     self._job_running = False
                     self.set_task(active=False)
-                    self.set_status("ATBP finished ✓")
-                    self.task_log("[ATBP] finished OK")
+                    aborted = self._job_was_aborted("ATBP")
+                    run_dir_p = Path(run_dir)
+                    try:
+                        meta = self._read_atbp_run_meta(run_dir_p)
+                        meta["status"] = "aborted" if aborted else "finished"
+                        meta.pop("failure_reason", None)
+                        meta.pop("failure_kind", None)
+                        _write_json_file(run_dir_p / "run.json", meta)
+                    except Exception:
+                        pass
+                    if aborted:
+                        self.set_status("ATBP aborted")
+                        self.task_log("[ATBP] aborted by user")
+                    else:
+                        self.set_status("ATBP finished ✓")
+                        self.task_log("[ATBP] finished OK")
+                        try:
+                            self._set_active_atbp_run(run_dir_p)
+                        except Exception:
+                            pass
 
-                    # Update ATBP page widgets (if present)
+
                     try:
                         p = self.pages.get("ATBP")
                         if p is not None:
-                            # Stop page-local progress bar + re-enable buttons
                             if hasattr(p, "on_atbp_done"):
                                 try:
                                     p.on_atbp_done(Path(out_path) if out_path else None)
@@ -4001,8 +5694,7 @@ class App(tk.Tk):
                             if hasattr(p, "var_out"):
                                 p.var_out.set(str(out_path))
                             if hasattr(p, "lbl_status"):
-                                p.lbl_status.configure(text=f"✔ Prepared/ran: {run_dir}")
-                            # Enable parse/export buttons if they exist
+                                p.lbl_status.configure(text=(f"ATBP aborted: {run_dir_p.name}" if aborted else f"✔ Prepared/ran: {run_dir_p}"))
                             if hasattr(p, "btn_parse"):
                                 p.btn_parse.configure(state="normal")
                             if hasattr(p, "btn_export_json"):
@@ -4012,29 +5704,86 @@ class App(tk.Tk):
                     except Exception:
                         pass
 
+                    self._reset_abort_state()
                     self.refresh_all_pages()
+
+                elif kind == "atbp_issue":
+                    issue, out_path, run_dir = item[1], item[2], item[3]
+                    self._job_running = False
+                    self.set_task(active=False)
+                    aborted = self._job_was_aborted("ATBP")
+                    run_dir_p = Path(run_dir)
+                    try:
+                        meta = self._read_atbp_run_meta(run_dir_p)
+                        meta["status"] = "aborted" if aborted else "failed"
+                        if (not aborted) and isinstance(issue, dict):
+                            meta["failure_reason"] = str(issue.get("failure_reason") or "ATBP output issue")
+                            meta["failure_kind"] = str(issue.get("kind") or "output_issue")
+                        _write_json_file(run_dir_p / "run.json", meta)
+                    except Exception:
+                        pass
+
+                    try:
+                        p = self.pages.get("ATBP")
+                        if p is not None:
+                            if hasattr(p, "var_out"):
+                                p.var_out.set(str(out_path))
+                            if hasattr(p, "lbl_status"):
+                                p.lbl_status.configure(text=(f"ATBP aborted: {run_dir_p.name}" if aborted else f"ATBP failed: {run_dir_p.name}"))
+                            if hasattr(p, "_set_running"):
+                                p._set_running(False)
+                    except Exception:
+                        pass
+
+                    self.set_status("ATBP aborted" if aborted else "ATBP failed")
+                    if aborted:
+                        self.task_log("[ATBP] aborted by user")
+                    else:
+                        self.task_log("[ATBP] output issue: " + str(issue.get("failure_reason") if isinstance(issue, dict) else issue))
+                    self._reset_abort_state()
+                    self.refresh_all_pages()
+                    if not aborted and isinstance(issue, dict):
+                        box = messagebox.showwarning if issue.get("kind") in ("gauss_quadrature", "no_charge_values") else messagebox.showerror
+                        box(str(issue.get("title") or "ATBP"), str(issue.get("message") or "ATBP output issue"))
 
                 elif kind == "atbp_fail":
                     msg, run_dir = item[1], item[2]
                     self._job_running = False
                     self.set_task(active=False)
-                    self.set_status("ATBP failed")
-                    self.task_log("[ATBP] failed: " + str(msg))
-
+                    aborted = self._job_was_aborted("ATBP")
+                    self.set_status("ATBP aborted" if aborted else "ATBP failed")
+                    self.task_log(("[ATBP] aborted by user" if aborted else "[ATBP] failed: " + str(msg)))
                     try:
-                        p = self.pages.get("ATBP")
-                        if p is not None and hasattr(p, "on_atbp_fail"):
-                            try:
-                                p.on_atbp_fail(str(msg))
-                            except Exception:
-                                pass
-                        if p is not None and hasattr(p, "lbl_status"):
-                            p.lbl_status.configure(text=f"✖ Failed: {run_dir}" if run_dir else "✖ Failed")
+                        if run_dir:
+                            run_dir_p = Path(run_dir)
+                            meta = self._read_atbp_run_meta(run_dir_p)
+                            meta["status"] = "aborted" if aborted else "failed"
+                            if aborted:
+                                meta.pop("failure_reason", None)
+                                meta.pop("failure_kind", None)
+                            _write_json_file(run_dir_p / "run.json", meta)
                     except Exception:
                         pass
 
+                    try:
+                        p = self.pages.get("ATBP")
+                        if p is not None:
+                            if (not aborted) and hasattr(p, "on_atbp_fail"):
+                                try:
+                                    p.on_atbp_fail(str(msg))
+                                except Exception:
+                                    pass
+                            elif hasattr(p, "_set_running"):
+                                p._set_running(False)
+                            if hasattr(p, "lbl_status"):
+                                p.lbl_status.configure(text=(f"ATBP aborted: {run_dir}" if aborted and run_dir else (f"✖ Failed: {run_dir}" if run_dir else "✖ Failed")))
+                    except Exception:
+                        pass
+
+                    self._reset_abort_state()
                     self.refresh_all_pages()
-                    messagebox.showerror("ATBP", str(msg))
+                    if not aborted:
+                        messagebox.showerror("ATBP", str(msg))
 
                 elif kind == "trho_run_ready":
                     run_dir = Path(item[1])
@@ -4067,21 +5816,63 @@ class App(tk.Tk):
                     self.refresh_all_pages()
 
                 elif kind == "parsed":
-                    # Non-blocking: store summary and update status (do not open modal dialogs here)
+
                     summary = item[1]
                     self.task_log("[TRHO] " + summary)
                     self.set_status("✔ TRHO parsed")
 
-                
+
+                elif kind == "trho_issue":
+                    issue, run_dir = item[1], item[2]
+                    self._job_running = False
+                    self.set_task(active=False)
+                    self._clear_active_process()
+                    try:
+                        p = self.pages.get("Compute")
+                        if p is not None and hasattr(p, "_set_running"):
+                            p._set_running(False)
+                    except Exception:
+                        pass
+                    msg = issue.get("message", issue.get("title", "TRHO output issue")) if isinstance(issue, dict) else str(issue)
+                    title = issue.get("title", "TRHO output issue") if isinstance(issue, dict) else "TRHO output issue"
+                    kind_txt = issue.get("kind", "output issue") if isinstance(issue, dict) else "output issue"
+                    self.state.trho_done = True
+                    self.state.trho_parsed = None
+                    self.state.trho_parse_error = msg
+                    self.state.trho_output_issue = issue if isinstance(issue, dict) else {"kind": kind_txt, "message": msg}
+                    self.set_status(f"TRHO failed ({kind_txt})")
+                    self.task_log(f"[TRHO] failed: {title}")
+                    try:
+                        if run_dir:
+                            run_dir_p = Path(run_dir)
+                            meta = self._read_trho_run_meta(run_dir_p)
+                            meta["status"] = "failed"
+                            meta["failure_kind"] = kind_txt
+                            meta["failure_reason"] = msg
+                            _write_json_file(run_dir_p / "run.json", meta)
+                    except Exception:
+                        pass
+                    self.refresh_all_pages()
+                    messagebox.showerror("TRHO output issue", msg, parent=self)
+
                 elif kind == "parse_error":
                     err = item[1]
-                    # Parsing failed (but TRHO may have finished). Keep GUI responsive and show a clear status.
+
                     self.set_status("TRHO finished (parsing failed)")
-                    # Keep a short note in the log; details already in the log above.
+
                     self.task_log("[TRHO] parsing failed (see log / Execution Details).")
                     self.refresh_all_pages()
                 elif kind == "done":
                     rc = int(item[1])
+                    aborted = self._job_was_aborted("TRHO")
+                    try:
+                        run_dir = Path(str((getattr(self.state, "last_execution", {}) or {}).get("cwd") or ""))
+                        if run_dir and run_dir.exists():
+                            meta = self._read_trho_run_meta(run_dir)
+                            meta["status"] = ("finished" if (rc == 0 and not aborted) else ("aborted" if aborted else "failed"))
+                            _write_json_file(run_dir / "run.json", meta)
+                    except Exception:
+                        pass
                     self._job_running = False
                     self.set_task(active=False)
                     try:
@@ -4091,7 +5882,7 @@ class App(tk.Tk):
                     except Exception:
                         pass
 
-                    if rc == 0:
+                    if rc == 0 and not aborted and not getattr(self.state, "trho_output_issue", None):
                         self.state.trho_done = True
                         self.set_status("TRHO finished ✓")
                         self.task_log("[TRHO] finished OK (rc=0)")
@@ -4120,7 +5911,7 @@ class App(tk.Tk):
                         except Exception:
                             pass
 
-                        # Optional: delete log after a clean TRHO run (user preference)
+
                         if getattr(self.state, "delete_log_on_trho_success", False):
                             try:
                                 lp = _log_path(self.state)
@@ -4129,8 +5920,8 @@ class App(tk.Tk):
                             except Exception:
                                 pass
                     else:
-                        self.set_status(f"TRHO failed (rc={rc})")
-                        self.task_log(f"[TRHO] failed (rc={rc})")
+                        self.set_status("TRHO aborted" if aborted else f"TRHO failed (rc={rc})")
+                        self.task_log("[TRHO] aborted by user" if aborted else f"[TRHO] failed (rc={rc})")
                         try:
                             p = self.pages.get("Compute")
                             if p is not None:
@@ -4150,14 +5941,16 @@ class App(tk.Tk):
                                     if hasattr(p, "set_runtime_text"):
                                         p.set_runtime_text("Total TRHO calculation time: unavailable")
                                 if hasattr(p, "set_completion_text"):
-                                    p.set_completion_text(f"TRHO failed ✖ (rc={rc})")
+                                    p.set_completion_text("TRHO aborted" if aborted else f"TRHO failed ✖ (rc={rc})")
                         except Exception:
                             pass
 
-                    # Ensure pages update enable/disable rules immediately
+
+                    self._reset_abort_state()
                     self.refresh_all_pages()
 
                 elif kind == "error":
+                    aborted = self._job_was_aborted("TRHO")
                     self._job_running = False
                     self.set_task(active=False)
                     try:
@@ -4166,8 +5959,8 @@ class App(tk.Tk):
                             p._set_running(False)
                     except Exception:
                         pass
-                    self.set_status("TRHO error")
-                    self.task_log(f"[ERROR] {item[1]}")
+                    self.set_status("TRHO aborted" if aborted else "TRHO error")
+                    self.task_log("[TRHO] aborted by user" if aborted else f"[ERROR] {item[1]}")
                     try:
                         p = self.pages.get("Compute")
                         if p is not None:
@@ -4187,9 +5980,11 @@ class App(tk.Tk):
                                 if hasattr(p, "set_runtime_text"):
                                     p.set_runtime_text("Total TRHO calculation time: unavailable")
                             if hasattr(p, "set_completion_text"):
-                                p.set_completion_text("TRHO failed ✖")
+                                p.set_completion_text("TRHO aborted" if aborted else "TRHO failed ✖")
                     except Exception:
                         pass
+                    self._reset_abort_state()
+                    self.refresh_all_pages()
 
         except queue.Empty:
             pass
@@ -4200,13 +5995,63 @@ class App(tk.Tk):
         messagebox.showinfo(
             "Help",
             "Workflow:\n"
-            "1) Choose Workspace folder\n"
-            "2) App auto-validates (fort.9 or *.f9 + write)\n"
-            "3) Go to Compute and run TRHO\n\n"
-            "fort.9 creation is automatic ONLY when TRHO starts (if needed)."
+            "1) Choose a workspace folder\n"
+            "2) The workspace is automatically validated\n"
+            "3) Run TRHO (or another TOPOND module)\n\n"
+            "fort.9 is created automatically only when a TOPOND calculation starts (if needed).\n\n"
+            "For macOS diagnostics, use Help > System Diagnostics to collect information about the runtime environment."
         )
 
-    
+    def _show_system_diagnostics(self):
+        diag_txt = format_system_diagnostics(collect_system_diagnostics(self))
+        win = tk.Toplevel(self)
+        _ensure_floating_window(win)
+        win.title("System diagnostics")
+        win.geometry("760x520")
+        win.minsize(620, 380)
+
+        frm = ttk.Frame(win, padding=12)
+        frm.pack(fill="both", expand=True)
+        frm.rowconfigure(0, weight=1)
+        frm.columnconfigure(0, weight=1)
+
+        txt = tk.Text(frm, wrap="none")
+        txt.grid(row=0, column=0, sticky="nsew")
+        ysb = ttk.Scrollbar(frm, orient="vertical", command=txt.yview)
+        ysb.grid(row=0, column=1, sticky="ns")
+        xsb = ttk.Scrollbar(frm, orient="horizontal", command=txt.xview)
+        xsb.grid(row=1, column=0, sticky="ew")
+        txt.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
+        txt.insert("1.0", diag_txt)
+        txt.configure(state="disabled")
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=2, column=0, columnspan=2, sticky="e", pady=(10, 0))
+
+        def _copy():
+            try:
+                self.clipboard_clear()
+                self.clipboard_append(diag_txt)
+                self.set_status("System diagnostics copied to clipboard ✓")
+            except Exception:
+                pass
+
+        def _save():
+            fp = filedialog.asksaveasfilename(
+                parent=win,
+                title="Save diagnostics",
+                defaultextension=".txt",
+                filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+                initialfile="topiso3d_diagnostics.txt",
+            )
+            if fp:
+                Path(fp).write_text(diag_txt, encoding="utf-8")
+
+        ttk.Button(btns, text="Copy", command=_copy).pack(side="left", padx=(0, 8))
+        ttk.Button(btns, text="Save…", command=_save).pack(side="left", padx=(0, 8))
+        ttk.Button(btns, text="Close", command=win.destroy).pack(side="left")
+
+
     def _build_menubar(self) -> None:
         menubar = tk.Menu(self)
 
@@ -4219,6 +6064,8 @@ class App(tk.Tk):
         menubar.add_cascade(label="Tools", menu=m_tools)
 
         m_help = tk.Menu(menubar, tearoff=0)
+        m_help.add_command(label="System diagnostics…", command=self._show_system_diagnostics)
+        m_help.add_separator()
         m_help.add_command(label="About", command=self._about)
         menubar.add_cascade(label="Help", menu=m_help)
 
@@ -4228,7 +6075,15 @@ class App(tk.Tk):
         SettingsDialog(self)
 
     def _about(self):
-        messagebox.showinfo("About", "TopIso3D v2026 template: auto-validate Workspace + TRHO runner (mock).")
+        messagebox.showinfo("About",
+                    "TopIso3D v2026\n\n"
+                    "Graphical environment for visualization and analysis of "
+                    "TOPOND QTAIM calculations.\n\n"
+                    "Developed by Ary da Silva Maia\n"
+                    "Federal University of Paraíba (UFPB), Brazil\n\n"
+                    "Multiplatform edition (Windows, Linux and macOS)"
+                    "https://topiso3d.ufpb.com"
+                    )
 
     def _cleanup_run_temp_files(self, run_dir: Path, tag: str = "RUN") -> None:
         """Best-effort cleanup of temporary CRYSTAL/Properties files copied into a run folder.
@@ -4380,8 +6235,8 @@ class App(tk.Tk):
                     _s("RMAX", "5.0"),
                 ])
             )
-            # For IAUTO = 3, TOPOND expects an extra TH line only when IMETH = 1.
-            # With IMETH = 0, the grid definition follows immediately after the main line.
+
+
             if imeth == "1":
                 lines.append(_s("TH", "0.0"))
             lines.append(",".join([_s("XMI", "0.0"), _s("XMA", "5.0"), _s("XINC", "0.5")]))
@@ -4604,12 +6459,12 @@ class App(tk.Tk):
         return inp
 
     def prepare_atbp_folder(self) -> Path:
-        """Create atbp/ folder and ensure fort.9 is inside it (same logic as TRHO)."""
+        """Create a new ATBP run folder under atbp_runs/ and ensure fort.9 is inside it."""
         workdir = self.state.workspace_dir
         if not workdir:
             raise RuntimeError("No workspace_dir")
 
-        atbp_dir = workdir / "atbp"
+        atbp_dir = self._next_atbp_run_dir()
         atbp_dir.mkdir(parents=True, exist_ok=True)
 
         src_fort9 = workdir / "fort.9"
@@ -4632,15 +6487,241 @@ class App(tk.Tk):
             f.write(s)
         return inp
 
+    def _atbp_runs_dir(self) -> Optional[Path]:
+        ws = getattr(self.state, "workspace_dir", None)
+        return (ws / "atbp_runs") if ws else None
+
+    def _list_atbp_run_dirs(self) -> List[Path]:
+        root = self._atbp_runs_dir()
+        if root is None or not root.exists():
+            return []
+        runs = []
+        try:
+            for p in sorted(root.iterdir()):
+                if p.is_dir() and self._find_matching_output_in_dirs([p], self._configured_output_names("atbp")) is not None:
+                    runs.append(p)
+        except Exception:
+            pass
+        return runs
+
+    def _read_atbp_run_meta(self, run_dir: Path) -> dict:
+        meta = _read_json_file(run_dir / "run.json")
+        if not meta:
+            meta = {"kind": "ATBP", "run_name": run_dir.name, "status": "unknown"}
+        return meta
+
+    def _friendly_atbp_run_label(self, run_dir: Path) -> str:
+        meta = self._read_atbp_run_meta(run_dir)
+        run_name = str(meta.get("run_name") or "").strip()
+        created = str(meta.get("created_at") or "").strip()
+        short_time = created[11:16] if len(created) >= 16 else created
+        status = str(meta.get("status") or "").strip()
+        parts = []
+        parts.append(run_name or run_dir.name)
+        if short_time:
+            parts.append(short_time)
+        if status and status not in ("unknown",):
+            parts.append(status)
+        return " | ".join(parts)
+
+    def _get_atbp_run_selector_data(self) -> Tuple[List[str], Dict[str, Path], str]:
+        runs = list(self._list_atbp_run_dirs())
+        active = self._get_active_atbp_dir()
+        try:
+            if active is not None:
+                active_p = Path(active)
+                if active_p.exists() and all(active_p.resolve() != rd.resolve() for rd in runs):
+                    runs.insert(0, active_p)
+        except Exception:
+            pass
+
+        raw_labels = []
+        for rd in runs:
+            try:
+                raw_labels.append((rd, self._friendly_atbp_run_label(rd) or rd.name))
+            except Exception:
+                raw_labels.append((rd, rd.name))
+
+        counts = {}
+        for _, lbl in raw_labels:
+            counts[lbl] = counts.get(lbl, 0) + 1
+
+        values: List[str] = []
+        options: Dict[str, Path] = {}
+        active_label = "—"
+        for rd, lbl in raw_labels:
+            display = f"{lbl} [{rd.name}]" if counts.get(lbl, 0) > 1 else lbl
+            values.append(display)
+            options[display] = rd
+            try:
+                if active is not None and Path(active).resolve() == rd.resolve():
+                    active_label = display
+            except Exception:
+                pass
+
+        if values and active_label == "—":
+            active_label = values[-1]
+        return values, options, active_label
+
+    def _get_active_atbp_dir(self) -> Optional[Path]:
+        state = self._load_workspace_state()
+        rel = str(state.get("active_atbp") or "").strip()
+        ws = getattr(self.state, "workspace_dir", None)
+        if ws and rel:
+            p = (ws / rel).resolve()
+            try:
+                if p.exists() and self._find_matching_output_in_dirs([p], self._configured_output_names("atbp")) is not None:
+                    return p
+            except Exception:
+                pass
+        runs = self._list_atbp_run_dirs()
+        return runs[-1] if runs else None
+
+    def _find_active_atbp_out(self) -> Optional[Path]:
+        run_dir = self._get_active_atbp_dir()
+        if run_dir is None:
+            return None
+        return self._find_matching_output_in_dirs([run_dir], self._configured_output_names("atbp"))
+
+    def _set_active_atbp_run(self, run_dir: Path) -> None:
+        ws = getattr(self.state, "workspace_dir", None)
+        if ws is None:
+            return
+        try:
+            rel = str(run_dir.resolve().relative_to(ws.resolve()))
+        except Exception:
+            rel = str(run_dir)
+        state = self._load_workspace_state()
+        state["active_atbp"] = rel
+        self._save_workspace_state(state)
+        self.state.atbp_run_dir = run_dir
+        self.state.atbp_out_path = self._find_matching_output_in_dirs([run_dir], self._configured_output_names("atbp"))
+
+    def _next_atbp_run_dir(self) -> Path:
+        root = self._atbp_runs_dir()
+        if root is None:
+            raise RuntimeError("No workspace_dir")
+        root.mkdir(parents=True, exist_ok=True)
+        used = set()
+        for p in root.iterdir() if root.exists() else []:
+            if p.is_dir():
+                m = re.match(r"atbp_(\d+)$", p.name)
+                if m:
+                    used.add(int(m.group(1)))
+        n = 1
+        while n in used:
+            n += 1
+        return root / f"atbp_{n:03d}"
+
+    def _build_atbp_run_metadata(self, run_dir: Path) -> dict:
+        return {
+            "kind": "ATBP",
+            "run_name": run_dir.name,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "status": "finished",
+        }
+
+    def _extract_atbp_error_line(self, out_path: Path, pattern: str) -> str:
+        try:
+            import re as _re
+            rgx = _re.compile(pattern, _re.IGNORECASE)
+            for ln in out_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                if rgx.search(ln):
+                    return " ".join(str(ln).split())
+        except Exception:
+            pass
+        return ""
+
+    def _inspect_atbp_output(self, out_path: Path) -> Optional[dict]:
+        """Inspect ATBP output for known failure/incomplete-result patterns.
+
+        Returns None when the run looks valid enough, otherwise a dict with:
+          - kind: gauss_quadrature | generic_error | no_charge_values
+          - title: popup title
+          - message: user-facing popup text
+          - failure_reason: concise reason for run.json
+        """
+        try:
+            text = out_path.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            return {
+                "kind": "generic_error",
+                "title": "ATBP failed",
+                "message": f"The ATBP output could not be inspected.\n\n{e}",
+                "failure_reason": f"ATBP output could not be inspected: {e}",
+            }
+
+        up = text.upper()
+        if "GAUSS QUADRATURE NOT AVAILABLE" in up:
+            detail = self._extract_atbp_error_line(out_path, r"GAUSS\s+QUADRATURE\s+NOT\s+AVAILABLE")
+            return {
+                "kind": "gauss_quadrature",
+                "title": "ATBP warning",
+                "message": (
+                    "For this system, ATBP in STD mode is not advisable because the calculation stopped with a "
+                    "Gauss quadrature error.\n\n"
+                    "No charge values were written to the output table.\n"
+                    "Please try the calculation with another mode."
+                ),
+                "failure_reason": detail or "Gauss quadrature not available",
+            }
+
+        error_markers = [
+            "ERROR ****",
+            " FATAL ",
+            "ABORT",
+            " SEVERE ",
+            " YIELD ",
+        ]
+        if any(tok in up for tok in error_markers):
+            detail = ""
+            for pat in [r"ERROR\s*\*+.*", r"FATAL.*", r"ABORT.*", r"YIELD.*"]:
+                detail = self._extract_atbp_error_line(out_path, pat)
+                if detail:
+                    break
+            return {
+                "kind": "generic_error",
+                "title": "ATBP failed",
+                "message": (
+                    "The ATBP calculation did not finish successfully.\n\n"
+                    "Please inspect the ATBP output file for details."
+                ),
+                "failure_reason": detail or "ATBP output contains an error marker",
+            }
+
+        try:
+            df = parse_atbp_output(out_path)
+        except Exception:
+            df = pd.DataFrame()
+        if df is None or df.empty:
+            return {
+                "kind": "no_charge_values",
+                "title": "ATBP warning",
+                "message": (
+                    "The ATBP calculation finished without producing charge values in the output table.\n\n"
+                    "Please inspect the ATBP output file and consider testing another mode."
+                ),
+                "failure_reason": "ATBP finished without charge values in the output table",
+            }
+
+        return None
+
     def run_atbp(self, snippet: str) -> None:
-        """Run ATBP via properties, creating workspace/atbp with atbp.inp and atbp.out."""
+        """Run ATBP via properties, creating a new workspace/atbp_runs/atbp_xxx folder."""
         if self._job_running:
             messagebox.showinfo("ATBP", "A job is already running.")
             return
 
         ctx = self.state
-        if not ctx.workspace_ok or not ctx.workspace_dir:
-            messagebox.showwarning("ATBP", "Workspace is not valid. Choose a folder with fort.9 or *.f9 and write permission.")
+        if not getattr(ctx, "workspace_compute_ok", False) or not ctx.workspace_dir:
+            messagebox.showwarning(
+                "ATBP",
+                "This workspace is import-only. To run ATBP, provide fort.9 or a wavefunction file (*.f9/*.9) "
+                        "and ensure that the workspace directory is writable."
+            )
+            return
+
+        if not self._ensure_properties_executable_ready("ATBP"):
             return
 
         ok, msg = self.ensure_fort9_for_run()
@@ -4661,9 +6742,15 @@ class App(tk.Tk):
                 atbp_dir = self.prepare_atbp_folder()
                 inp_path = self.write_atbp_input(atbp_dir, snippet)
                 out_path = atbp_dir / "atbp.out"
+                try:
+                    meta = self._build_atbp_run_metadata(atbp_dir)
+                    meta["status"] = "running"
+                    _write_json_file(atbp_dir / "run.json", meta)
+                except Exception:
+                    pass
 
                 exe = self.state.properties_exe
-                exe_path = self._resolve_executable(str(exe))
+                exe_path = str(_best_effort_make_executable(exe) or "")
                 if not exe_path:
                     self._job_queue.put(("atbp_fail", f"properties executable not found: {exe}", str(atbp_dir)))
                     return
@@ -4688,7 +6775,9 @@ class App(tk.Tk):
                         text=True,
                         bufsize=1,
                         universal_newlines=True,
+                        **_windows_subprocess_silent_kwargs(),
                     )
+                    self._register_active_process(p, "ATBP")
 
                     for line in p.stdout:
                         self._job_queue.put(("log", line.rstrip("\n")))
@@ -4697,27 +6786,25 @@ class App(tk.Tk):
                     p.wait()
 
                     rc = p.returncode
+                    self._clear_active_process(p)
                     self._cleanup_run_temp_files(atbp_dir, "ATBP")
                     if rc == 0 and out_path.exists():
-                        self._job_queue.put(("atbp_done", str(out_path), str(atbp_dir)))
+                        issue = self._inspect_atbp_output(out_path)
+                        if issue is None:
+                            self._job_queue.put(("atbp_done", str(out_path), str(atbp_dir)))
+                        else:
+                            self._job_queue.put(("atbp_issue", issue, str(out_path), str(atbp_dir)))
                     else:
                         self._job_queue.put(("atbp_fail", f"ATBP failed (rc={rc})", str(atbp_dir)))
 
             except Exception as e:
+                self._clear_active_process()
                 self._job_queue.put(("atbp_fail", str(e), ""))
 
         self._job_thread = threading.Thread(target=worker, daemon=True)
         self._job_thread.start()
 
 
-
-
-
-# -----------------------------
-# ATBP (Bader/QTAIM charges) utilities
-# -----------------------------
-
-# Minimal periodic table (1..118). Used only if we need Z to compute q = Z - N(Ω).
 _PERIODIC_TABLE = [
     None,
     "H","He",
@@ -4736,34 +6823,48 @@ _PERIODIC_TABLE = [
 ]
 _Z_BY_SYMBOL = {sym: i for i, sym in enumerate(_PERIODIC_TABLE) if sym}
 
-# Lightweight atomic radii (Å) for CP Viewer marker sizing.
-# Values are approximate covalent radii and are only used to improve visual
-# distinction between elements in the first 3D viewer.
-_COVALENT_RADII_ANG: Dict[str, float] = {
-    "H": 0.31, "He": 0.28,
-    "Li": 1.28, "Be": 0.96, "B": 0.84, "C": 0.76, "N": 0.71, "O": 0.66, "F": 0.57, "Ne": 0.58,
-    "Na": 1.66, "Mg": 1.41, "Al": 1.21, "Si": 1.11, "P": 1.07, "S": 1.05, "Cl": 1.02, "Ar": 1.06,
-    "K": 2.03, "Ca": 1.76, "Sc": 1.70, "Ti": 1.60, "V": 1.53, "Cr": 1.39, "Mn": 1.39, "Fe": 1.32,
-    "Co": 1.26, "Ni": 1.24, "Cu": 1.32, "Zn": 1.22, "Ga": 1.22, "Ge": 1.20, "As": 1.19, "Se": 1.20,
-    "Br": 1.20, "Kr": 1.16, "Rb": 2.20, "Sr": 1.95, "Y": 1.90, "Zr": 1.75, "Nb": 1.64, "Mo": 1.54,
-    "Tc": 1.47, "Ru": 1.46, "Rh": 1.42, "Pd": 1.39, "Ag": 1.45, "Cd": 1.44, "In": 1.42, "Sn": 1.39,
-    "Sb": 1.39, "Te": 1.38, "I": 1.39, "Xe": 1.40, "Cs": 2.44, "Ba": 2.15, "La": 2.07, "Ta": 1.70,
-}
 
-def _cpviewer_atom_radius_ang(symbol: str) -> float:
-    sym = str(symbol or "").strip().capitalize()
-    if sym in _COVALENT_RADII_ANG:
-        return float(_COVALENT_RADII_ANG[sym])
-    return 1.10
+CPVIEWER_ATOM_OPACITY = 0.85
+
+def _cpviewer_atomic_number_from_symbol(symbol: str) -> Optional[int]:
+    sym = str(symbol or "").strip()
+    if not sym:
+        return None
+    sym = sym[0].upper() + sym[1:].lower()
+    z = _Z_BY_SYMBOL.get(sym)
+    if z is not None:
+        return int(normalize_atomic_number(z))
+    m = re.match(r"Z\s*(\d+)$", sym, re.IGNORECASE)
+    if m:
+        try:
+            return int(normalize_atomic_number(int(m.group(1))))
+        except Exception:
+            return None
+    return None
 
 def _cpviewer_marker_size(symbol: str) -> float:
-    """Map approximate atomic radius (Å) to a reasonable Plotly marker size."""
-    r = _cpviewer_atom_radius_ang(symbol)
-    size = 6.0 + 5.0 * (r - 0.60)
-    return float(max(6.0, min(15.0, size)))
+    """Return visual atom marker size for CP Viewer from normalized atomic number.
+
+    Size classes are intentionally broad:
+      H-Be: 9, B-Ne: 11, Na-Ar: 13, K-Kr: 15, Rb+: 17.
+    This improves atom/CP contrast, including pseudopotential-coded atomic
+    numbers already normalized upstream.
+    """
+    z = _cpviewer_atomic_number_from_symbol(symbol)
+    if z is None:
+        return 11.0
+    if z <= 4:
+        return 9.0
+    if z <= 10:
+        return 11.0
+    if z <= 18:
+        return 13.0
+    if z <= 36:
+        return 15.0
+    return 17.0
 
 _ATBP_DEFAULT_TOL_BOHR: Dict[str, float] = {
-    # TOPOND manual defaults (ATBP, Table 4.1)
+
     "H": 1.139, "He": 0.64,
     "Li": 2.494, "Be":1.594, "B": 1.188, "C": 0.942, "N": 0.776, "O": 0.658, "F": 0.569,
     "Ne": 0.500, "Na": 3.436, "Mg": 2.549, "Al": 2.081, "Si": 1.760, "P": 1.522, "S": 1.341, "Cl": 1.198, "Ar": 1.080,
@@ -4947,7 +7048,7 @@ def _try_parse_table_atom_charge(text: str) -> List[Dict]:
     if header_idx is None:
         return rows
 
-    # Consume until blank line or non-numeric stretch
+
     data_re = re.compile(
         r'^\s*(?P<idx>\d+)\s+(?P<sym>[A-Za-z]{1,3})\b(?P<rest>.*)$'
     )
@@ -4958,7 +7059,7 @@ def _try_parse_table_atom_charge(text: str) -> List[Dict]:
             break
         m = data_re.match(ln)
         if not m:
-            # stop if table ended
+
             if len(rows) > 0:
                 break
             continue
@@ -4967,7 +7068,7 @@ def _try_parse_table_atom_charge(text: str) -> List[Dict]:
         nums = [float(x) for x in float_re.findall(m.group("rest"))]
         if not nums:
             continue
-        # Heuristic: last number is often the net charge
+
         charge = nums[-1]
         rows.append({
             "atom_index": idx,
@@ -4985,7 +7086,7 @@ def _parse_crystal_atom_table(text: str) -> List[Dict]:
     """Parse the CRYSTAL atom table (ATOM N.AT. ... ) and return list of atoms with coords in Å."""
     atoms: List[Dict] = []
     lines = text.splitlines()
-    # Find header line containing "ATOM N.AT."
+
     start_idx = None
     for i, ln in enumerate(lines):
         if "ATOM N.AT." in ln:
@@ -4993,7 +7094,7 @@ def _parse_crystal_atom_table(text: str) -> List[Dict]:
             break
     if start_idx is None:
         return atoms
-    # Data lines follow after a separator line of asterisks; stop at next separator/blank or non-matching
+
     data_re = re.compile(
         r'^\s*(\d+)\s+(\d+)\s+([A-Za-z]{1,3})\s+\d+\s+([-+]?\d+\.\d+)\s+([-+]?\d+\.\d+)\s+([-+]?\d+\.\d+)\s+'
     )
@@ -5290,7 +7391,6 @@ def _select_cpviewer_atoms_bbox(
     return df
 
 
-
 def _try_parse_atbp_populations_with_orig(text: str) -> List[Dict]:
     """Parse ATBP STD output blocks using ORIG.(AU) + ATOMIC POPULATIONS + VTOT.
 
@@ -5328,7 +7428,7 @@ def _try_parse_atbp_populations_with_orig(text: str) -> List[Dict]:
 
     lines = text.splitlines()
 
-    # Map character position to line index (cumulative)
+
     cum = []
     total = 0
     for ln in lines:
@@ -5336,7 +7436,7 @@ def _try_parse_atbp_populations_with_orig(text: str) -> List[Dict]:
         cum.append(total)
 
     def charpos_to_lineidx(pos: int) -> int:
-        # first index where cum[i] > pos
+
         lo, hi = 0, len(cum) - 1
         while lo < hi:
             mid = (lo + hi) // 2
@@ -5354,7 +7454,7 @@ def _try_parse_atbp_populations_with_orig(text: str) -> List[Dict]:
             continue
 
         li = charpos_to_lineidx(m.end())
-        # Search forward for ATOMIC POPULATIONS
+
         n_omega = None
         charge = None
         volume = None
@@ -5362,7 +7462,7 @@ def _try_parse_atbp_populations_with_orig(text: str) -> List[Dict]:
         j = li
         while j < len(lines) and j < li + 2500:
             if "ATOMIC POPULATIONS" in lines[j]:
-                # next ~30 lines contain N and Q
+
                 for k in range(j, min(j + 40, len(lines))):
                     s = lines[k].strip()
                     if s.startswith("N"):
@@ -5399,9 +7499,9 @@ def _try_parse_atbp_populations_with_orig(text: str) -> List[Dict]:
                                 volume = float(mm.group(0))
                             except Exception:
                                 pass
-            # stop once we passed the basin integration footer for this block
+
             if "ATBP" in lines[j] and "TELAPSE" in lines[j] and n_omega is not None and charge is not None:
-                # allow to continue a bit to catch VTOT, but we can stop early if already got it
+
                 if volume is not None:
                     break
             j += 1
@@ -5413,9 +7513,9 @@ def _try_parse_atbp_populations_with_orig(text: str) -> List[Dict]:
             "atom_index": int(a["atom_index"]),
             "symbol": a["symbol"],
             "n_omega": n_omega,
-            # TOPOND prints Q with its own sign convention; store it explicitly
+
             "q_topond": charge,
-            # Chemical sign (cation positive)
+
             "charge": (-charge if charge is not None else None),
             "volume": volume,
             "source": "block",
@@ -5427,9 +7527,9 @@ def _try_parse_atbp_populations_with_orig(text: str) -> List[Dict]:
 def _try_parse_blocks_atomic_basin(text: str) -> List[Dict]:
     """Heuristic: parse per-atom 'ATOMIC BASIN' blocks and extract N(Ω)/charge/volume if present."""
     rows = []
-    # Example patterns vary across TOPOND versions; keep broad.
+
     block_re = re.compile(r'ATOMIC\s+BASIN\s+OF\s+ATOM\s+(\d+)\s+([A-Za-z]{1,3})', re.IGNORECASE)
-    # Capture candidate numeric values
+
     num_re = re.compile(r'[-+]?\d*\.\d+(?:[Ee][-+]?\d+)?|[-+]?\d+(?:[Ee][-+]?\d+)?')
 
     lines = text.splitlines()
@@ -5437,8 +7537,7 @@ def _try_parse_blocks_atomic_basin(text: str) -> List[Dict]:
     if not idxs:
         return rows
 
-    # Convert char positions to line indices by scanning cumulative lengths
-    # We'll instead walk line-by-line and detect starts.
+
     i = 0
     while i < len(lines):
         m = block_re.search(lines[i])
@@ -5447,14 +7546,13 @@ def _try_parse_blocks_atomic_basin(text: str) -> List[Dict]:
             continue
         atom_index = int(m.group(1))
         sym = m.group(2).capitalize()
-        # scan next ~250 lines for properties
+
         scan = "\n".join(lines[i:i+250])
         n_omega = None
         charge = None
         volume = None
 
-        # common keys
-        # N(OMEGA) / ELECTRON POPULATION / POPULATION IN BASIN
+
         for pat in [
             r'N\s*\(\s*OMEGA\s*\)\s*[:=]\s*([\d\.Ee+-]+)',
             r'ELECTRON\s+POPULATION\s*[:=]\s*([\d\.Ee+-]+)',
@@ -5468,7 +7566,7 @@ def _try_parse_blocks_atomic_basin(text: str) -> List[Dict]:
                     pass
                 break
 
-        # NET CHARGE / CHARGE
+
         for pat in [
             r'NET\s+CHARGE\s*[:=]\s*([\d\.Ee+-]+)',
             r'ATOMIC\s+CHARGE\s*[:=]\s*([\d\.Ee+-]+)',
@@ -5482,7 +7580,7 @@ def _try_parse_blocks_atomic_basin(text: str) -> List[Dict]:
                     pass
                 break
 
-        # VOLUME
+
         for pat in [
             r'BASIN\s+VOLUME\s*[:=]\s*([\d\.Ee+-]+)',
             r'\bVOLUME\b\s*[:=]\s*([\d\.Ee+-]+)',
@@ -5495,7 +7593,7 @@ def _try_parse_blocks_atomic_basin(text: str) -> List[Dict]:
                     pass
                 break
 
-        # If charge missing but N(Ω) exists and we know Z: compute charge.
+
         if charge is None and n_omega is not None:
             Z = _Z_BY_SYMBOL.get(sym)
             if Z is not None:
@@ -5505,8 +7603,8 @@ def _try_parse_blocks_atomic_basin(text: str) -> List[Dict]:
             "atom_index": atom_index,
             "symbol": sym,
             "n_omega": n_omega,
-            # TOPOND prints Q with the electron-sign convention (often opposite of "chemical" charge).
-            # We store both: q_topond (as printed) and charge = -q_topond (so cations are positive).
+
+
             "q_topond": charge,
             "charge": (-charge if charge is not None else None),
             "volume": volume,
@@ -5532,9 +7630,9 @@ def parse_atbp_output(out_path: Path) -> pd.DataFrame:
         return pd.DataFrame(columns=["atom_index", "symbol", "n_omega", "charge", "volume", "source"])
 
     df = pd.DataFrame(rows)
-    # keep one row per atom (prefer block info if both exist)
+
     if df["atom_index"].duplicated().any():
-        # rank sources: block > table
+
         src_rank = {"block": 0, "table": 1}
         df["_r"] = df["source"].map(lambda s: src_rank.get(s, 9))
         df = df.sort_values(["atom_index", "_r"]).drop_duplicates("atom_index", keep="first").drop(columns=["_r"])
@@ -5542,7 +7640,7 @@ def parse_atbp_output(out_path: Path) -> pd.DataFrame:
     return df
 
 def ensure_atbp_dir(workspace_dir: Path) -> Path:
-    atbp_dir = workspace_dir / "atbp"
+    atbp_dir = workspace_dir / "atbp_runs"
     atbp_dir.mkdir(parents=True, exist_ok=True)
     return atbp_dir
 
@@ -5562,6 +7660,24 @@ def _compact_bcp_dist_headers(df: Optional[pd.DataFrame]) -> pd.DataFrame:
         for c in out.columns
     ]
     return out
+
+
+def _reorder_bcp_report_columns(df: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """Return a BCP table with identification columns grouped first.
+
+    N is the TopIso3D selection index, when present. TOPOND_CP_N is the original
+    critical-point number reported by TOPOND. Keeping these columns side-by-side
+    makes comparison between TopIso3D tables and the original TOPOND output easier.
+    """
+    if df is None:
+        return pd.DataFrame()
+    out = df.copy()
+    if out.empty:
+        return out
+
+    first = [c for c in ("N", "TOPOND_CP_N") if c in out.columns]
+    rest = [c for c in out.columns if c not in first]
+    return out.loc[:, first + rest]
 
 def _report_display_df(df: Optional[pd.DataFrame]) -> pd.DataFrame:
     """Return a copy suitable for GUI/exports, keeping geometry only in Å.
@@ -5629,9 +7745,6 @@ def _tlap_run_info_df(parsed, ctx) -> pd.DataFrame:
     return pd.DataFrame([row])
 
 
-# -----------------------------
-# Base Page
-# -----------------------------
 class BasePage(ttk.Frame):
     title = "Page"
 
@@ -5646,11 +7759,20 @@ class BasePage(ttk.Frame):
         ttk.Label(header, text=self.title, font=("TkDefaultFont", 16, "bold")).pack(side="left")
         ttk.Separator(self).pack(fill="x", pady=(0, 12))
 
+    def _make_scrollable_body(self) -> ttk.Frame:
+        outer, canvas, vbar, inner = _make_scrollable_frame(self, canvas_bg=str(self.app.cget("bg") or "#999999"))
+        outer.pack(fill="both", expand=True)
+        self._scroll_outer = outer
+        self._scroll_canvas = canvas
+        self._scroll_vbar = vbar
+        self._scroll_inner = inner
+        return inner
+
     def on_show(self):
         pass
 
     def refresh_state(self):
-        # Default: call self.refresh() if the page defines it.
+
         fn = getattr(self, 'refresh', None)
         if callable(fn):
             try:
@@ -5659,9 +7781,6 @@ class BasePage(ttk.Frame):
                 pass
 
 
-# -----------------------------
-# CP Viewer Page
-# -----------------------------
 class CPViewerPage(BasePage):
     title = "CP Viewer"
 
@@ -5708,21 +7827,21 @@ class CPViewerPage(BasePage):
         self.var_counts = tk.StringVar(value="No parsed TRHO data available.")
         ttk.Label(frm_sum, textvariable=self.var_counts, wraplength=self._wrap, justify="left").grid(row=0, column=0, sticky="ew")
 
-        frm_actions = ttk.LabelFrame(body, text="Actions", padding=(12, 8))
-        frm_actions.grid(row=3, column=0, sticky="ew", pady=(12, 0))
+        frm_actions = ttk.LabelFrame(body, text="Actions", padding=(12, 6))
+        frm_actions.grid(row=3, column=0, sticky="ew", pady=(8, 0))
         frm_actions.columnconfigure(0, weight=1)
         frm_actions.columnconfigure(1, weight=0)
 
         self.lbl_status = ttk.Label(frm_actions, text="CP Viewer not ready", wraplength=self._wrap, justify="left")
-        self.lbl_status.grid(row=0, column=0, columnspan=2, sticky="ew")
+        self.lbl_status.grid(row=0, column=0, sticky="ew")
 
         frm_left = ttk.Frame(frm_actions)
-        frm_left.grid(row=1, column=0, sticky="nw", pady=(8, 0))
+        frm_left.grid(row=1, column=0, sticky="nw", pady=(2, 0))
         frm_left.columnconfigure(0, weight=1)
         self.frm_actions_left = frm_left
 
         frm_right = ttk.Frame(frm_actions)
-        frm_right.grid(row=1, column=1, sticky="ne", padx=(18, 0), pady=(8, 0))
+        frm_right.grid(row=0, column=1, rowspan=2, sticky="ne", padx=(18, 0), pady=(0, 0))
         frm_right.columnconfigure(0, weight=1)
         self.frm_actions_right = frm_right
 
@@ -5743,7 +7862,7 @@ class CPViewerPage(BasePage):
             width=16,
             values=["Rho", "Laplacian", "Both"],
         )
-        self.cmb_cp_source.grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.cmb_cp_source.grid(row=1, column=0, sticky="w", pady=(4, 0))
         self.cmb_cp_source.bind("<<ComboboxSelected>>", lambda _e: self._refresh_cp_source_ui())
 
         self.var_show_bondpaths = tk.BooleanVar(value=True)
@@ -5752,10 +7871,10 @@ class CPViewerPage(BasePage):
             text="Show bond paths associated with BCPs",
             variable=self.var_show_bondpaths,
         )
-        self.chk_show_bondpaths.grid(row=2, column=0, sticky="w", pady=(10, 0))
+        self.chk_show_bondpaths.grid(row=2, column=0, sticky="w", pady=(6, 0))
 
         frm_tlap = ttk.LabelFrame(frm_left, text="Laplacian CP filters", padding=(10, 6))
-        frm_tlap.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        frm_tlap.grid(row=3, column=0, sticky="ew", pady=(6, 0))
         self.frm_tlap_filters = frm_tlap
         self.var_show_tlap_attr = tk.BooleanVar(value=True)
         self.var_show_tlap_bcp = tk.BooleanVar(value=False)
@@ -5773,7 +7892,7 @@ class CPViewerPage(BasePage):
         self.var_save_html = tk.BooleanVar(value=False)
         self.var_save_note = tk.StringVar(value="")
         frm_save = ttk.Frame(frm_right)
-        frm_save.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        frm_save.grid(row=1, column=0, sticky="ew", pady=(2, 0))
         self.frm_save_html = frm_save
         self.chk_save_html = ttk.Checkbutton(
             frm_save,
@@ -5786,13 +7905,13 @@ class CPViewerPage(BasePage):
             text="in active TRHO run folder",
             wraplength=210,
             justify="left",
-        ).grid(row=1, column=0, sticky="w", padx=(22, 0), pady=(1, 0))
+        ).grid(row=1, column=0, sticky="w", padx=(22, 0), pady=(0, 0))
         ttk.Label(
             frm_save,
             textvariable=self.var_save_note,
             justify="left",
             wraplength=210,
-        ).grid(row=2, column=0, sticky="w", padx=(22, 0), pady=(1, 0))
+        ).grid(row=2, column=0, sticky="w", padx=(22, 0), pady=(0, 0))
 
         frm_render = ttk.LabelFrame(body, text="Rendering parameters", padding=(12, 8))
         frm_render.grid(row=6, column=0, sticky="ew", pady=(12, 0))
@@ -5814,13 +7933,17 @@ class CPViewerPage(BasePage):
         )
         self.cmb_cell_color.grid(row=0, column=3, sticky="w", padx=(6, 18))
 
-        self.var_cell_width = tk.StringVar(value="2.0")
-        ttk.Label(frm_render, text="Unit-cell width:").grid(row=1, column=0, sticky="w", pady=(10, 0))
-        ttk.Entry(frm_render, textvariable=self.var_cell_width, width=8).grid(row=1, column=1, sticky="w", padx=(6, 18), pady=(10, 0))
+        self.var_atom_opacity = tk.StringVar(value=f"{CPVIEWER_ATOM_OPACITY:.2f}")
+        ttk.Label(frm_render, text="Atoms opacity (0-1):").grid(row=1, column=0, sticky="w", pady=(10, 0))
+        ttk.Entry(frm_render, textvariable=self.var_atom_opacity, width=8).grid(row=1, column=1, sticky="w", padx=(6, 18), pady=(10, 0))
 
         self.var_cell_opacity = tk.StringVar(value="0.80")
         ttk.Label(frm_render, text="Unit-cell opacity (0-1):").grid(row=1, column=2, sticky="w", pady=(10, 0))
         ttk.Entry(frm_render, textvariable=self.var_cell_opacity, width=8).grid(row=1, column=3, sticky="w", padx=(6, 18), pady=(10, 0))
+
+        self.var_cell_width = tk.StringVar(value="2.0")
+        ttk.Label(frm_render, text="Unit-cell width:").grid(row=2, column=0, sticky="w", pady=(10, 0))
+        ttk.Entry(frm_render, textvariable=self.var_cell_width, width=8).grid(row=2, column=1, sticky="w", padx=(6, 18), pady=(10, 0))
 
         self._refresh_cp_source_ui()
 
@@ -5910,6 +8033,7 @@ class CPViewerPage(BasePage):
             return float(val)
 
         marker_scale = _safe_float(getattr(self, "var_marker_scale", tk.StringVar(value="1.0")), 1.0, vmin=0.4, vmax=4.0)
+        atom_opacity = _safe_float(getattr(self, "var_atom_opacity", tk.StringVar(value=f"{CPVIEWER_ATOM_OPACITY:.2f}")), CPVIEWER_ATOM_OPACITY, vmin=0.05, vmax=1.0)
         cell_width = _safe_float(getattr(self, "var_cell_width", tk.StringVar(value="2.0")), 2.0, vmin=0.5, vmax=8.0)
         cell_opacity = _safe_float(getattr(self, "var_cell_opacity", tk.StringVar(value="0.8")), 0.8, vmin=0.05, vmax=1.0)
         cell_color_label = str(getattr(self, "var_cell_color", tk.StringVar(value="Medium gray")).get() or "Medium gray").strip()
@@ -5921,7 +8045,7 @@ class CPViewerPage(BasePage):
         cell_rgb = cell_rgb_map.get(cell_color_label, (130, 130, 130))
         cell_rgba = f"rgba({cell_rgb[0]},{cell_rgb[1]},{cell_rgb[2]},{cell_opacity:.3f})"
 
-        # Atoms: grouped by element and sized with lightweight approximate atomic radii.
+
         atom_df = df_atoms.copy()
         atom_df["SYMBOL"] = atom_df.get("SYMBOL", pd.Series(["Atom"] * len(atom_df))).astype(str)
         for sym, grp in atom_df.groupby("SYMBOL", sort=True):
@@ -5946,7 +8070,7 @@ class CPViewerPage(BasePage):
                 mode="markers",
                 name=f"Atoms: {sym}",
                 legendgroup=f"atoms_{sym}",
-                marker=dict(size=atom_marker_size, symbol="circle", opacity=0.65),
+                marker=dict(size=atom_marker_size, symbol="circle", opacity=atom_opacity),
                 text=hover,
                 hovertemplate="%{text}<extra></extra>",
             ))
@@ -6146,8 +8270,7 @@ class CPViewerPage(BasePage):
         if show_rho_cps and bool(getattr(self, "var_show_bondpaths", tk.BooleanVar(value=True)).get()):
             _add_bond_path_overlay(fig, getattr(parsed, "df_bcp_props", pd.DataFrame()))
 
-        # Unit cell wireframe anchored on a *real lattice node* and chosen so the
-        # complete cell stays as visible as possible within the atom/CP context.
+
         cell_vecs = np.asarray(getattr(parsed, "cell_vectors_ang", np.zeros((0, 3))), dtype=float)
         cell_vertices_xyz = None
         if cell_vecs.shape == (3, 3):
@@ -6160,10 +8283,8 @@ class CPViewerPage(BasePage):
                 if atom_xyz.shape[0] > 0:
                     basis = np.column_stack((a, b, c))
                     frac = np.linalg.solve(basis, atom_xyz.T).T
-                    # Candidate lattice nodes from nearby integer translations around
-                    # the displayed atoms. We then choose the full primitive cell with
-                    # the smallest overflow beyond the atom bounding box, which keeps
-                    # the cell complete and crystallographically consistent.
+
+
                     frac_floor = np.floor(frac).astype(int)
                     candidates = set()
                     for base in frac_floor:
@@ -6249,8 +8370,7 @@ class CPViewerPage(BasePage):
                 showlegend=True,
             ))
 
-        # Keep the visible field tied primarily to the atoms + CPs, but ensure the
-        # selected unit cell is fully visible as well.
+
         plot_xyz = []
         try:
             atom_xyz = atom_df[["X_ANGSTROM", "Y_ANGSTROM", "Z_ANGSTROM"]].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
@@ -6340,12 +8460,11 @@ class CPViewerPage(BasePage):
 
             if bool(self.var_save_html.get()):
                 saved_path = self._next_saved_html_path(base_dir)
-                fig.write_html(str(saved_path), include_plotlyjs=True, auto_open=False)
-                webbrowser.open_new_tab(saved_path.as_uri())
+                _show_plotly_figure(fig, saved_html=saved_path)
                 self.var_save_note.set(f"Last saved HTML: {saved_path.name}")
                 self.app.set_status(f"CP Viewer opened and saved: {saved_path.name}")
             else:
-                fig.show(renderer="browser")
+                _show_plotly_figure(fig)
                 self.var_save_note.set("Preview opened in browser (not saved).")
                 self.app.set_status("CP Viewer opened")
         except Exception as e:
@@ -6458,9 +8577,6 @@ class CPViewerPage(BasePage):
         self.refresh()
 
 
-# -----------------------------
-# Workspace Page
-# -----------------------------
 class WorkspacePage(BasePage):
     title = "Workspace"
 
@@ -6471,7 +8587,7 @@ class WorkspacePage(BasePage):
         body.pack(fill="both", expand=True)
         body.columnconfigure(1, weight=1)
 
-        ttk.Label(body, text="Choose a folder that contains fort.9 OR a wavefunction file *.f9 (to run TRHO).").grid(
+        ttk.Label(body, text="Choose a folder with fort.9/*.f9/*.9 to run TOPOND, or with trho.out to inspect imported results.").grid(
             row=0, column=0, columnspan=2, sticky="w", pady=(0, 8)
         )
 
@@ -6490,8 +8606,9 @@ class WorkspacePage(BasePage):
             body,
             text=("Automatic behavior:\n"
                   "- Validation happens immediately after choosing the folder.\n"
-                  "- If only *.f9 exists, the app will create fort.9 automatically ONLY when TRHO starts.\n"
-                  "  (so we don't modify your folder until you actually run something)"),
+                  "- If only *.f9/*.9 exists, the app will create fort.9 automatically ONLY when a TOPOND calculation starts.\n"
+                  "  (so we don't modify your folder until you actually run something)\n"
+                  "- If only a configured TRHO output exists, the workspace is accepted as import-only: Reports and CP Viewer are available, but new TOPOND calculations are blocked."),
             justify="left"
         ).grid(row=5, column=0, columnspan=2, sticky="w")
 
@@ -6510,14 +8627,20 @@ class WorkspacePage(BasePage):
         self.app.ctx.df_true_atoms = None
         self.app.ctx.active_trho_run = None
         self.app.ctx.active_trho_label = "—"
+        self.app.ctx.active_tlap_run = None
+        self.app.ctx.active_tlap_label = "—"
         self.app.ctx.tlap_parse_attempted_out = ""
+        self.app.ctx.tlap_parsed = None
+        self.app.ctx.tlap_parse_error = None
+        self.app.ctx.tlap_done = False
+        self.app.ctx.atbp_run_dir = None
         self.app.ctx.atbp_out_path = None
         try:
             self.app.ctx.df_atbp = None
         except Exception:
             pass
 
-        # Auto-validate immediately (no button)
+
         self.app.auto_validate_workspace()
         self.app.set_status(self.app.ctx.workspace_msg)
 
@@ -6530,25 +8653,20 @@ class WorkspacePage(BasePage):
         self.lbl.config(text=f"Status: {self.app.ctx.workspace_msg}")
 
 
-# -----------------------------
-# Compute Page
-# -----------------------------
 class ComputePage(BasePage):
     title = "TRHO"
 
     _ADV_IAUTO_LABELS = {
         "IAUTO = -1  | Global automatic search around NEAs": "-1",
         "IAUTO = -2  | Global automatic search from seed point": "-2",
-        
+
     }
     _ADV_IAUTO_LABELS_INV = {v: k for k, v in _ADV_IAUTO_LABELS.items()}
 
     def _build(self):
         super()._build()
 
-        root = ttk.Frame(self)
-        root.pack(fill="both", expand=True)
-        root.rowconfigure(2, weight=1)
+        root = self._make_scrollable_body()
         root.columnconfigure(0, weight=1)
 
         self.frm_content = ttk.Frame(root)
@@ -6800,6 +8918,10 @@ class ComputePage(BasePage):
         self.btn_run = ttk.Button(self._pb_row, text="Run TRHO", command=self.app.run_trho)
         self.btn_run.grid(row=0, column=1, sticky="e", padx=(12, 0), pady=0)
 
+        self.btn_abort = ttk.Button(self._pb_row, text="Abort", command=lambda: self.app.abort_current_job("TRHO"))
+        self.btn_abort.grid(row=0, column=2, sticky="e", padx=(8, 0), pady=0)
+        self.btn_abort.configure(state="disabled")
+
         self._runtime_row = ttk.Frame(parent)
         self._runtime_row.pack(fill="x", pady=(0, 0))
         self._runtime_row.columnconfigure(0, weight=1)
@@ -7022,7 +9144,7 @@ class ComputePage(BasePage):
     def _edit_trho_constraints_placeholder(self):
         messagebox.showinfo(
             "TRHO constraints",
-            "Constraint editing will be connected in the next implementation step."
+            "TRHO constraint editing is not available in the current version."
         )
 
     def _stringify_param(self, value, *, default: str = "") -> str:
@@ -7095,7 +9217,7 @@ class ComputePage(BasePage):
             gui_rstar = float(str(cfg.get("RSTAR", "0.0") or "0.0").replace(",", "."))
         except Exception:
             gui_rstar = 0.0
-        # Positive GUI RSTAR acts as a global override; no per-element prompting needed.
+
         if gui_rstar > 0:
             return {}
 
@@ -7190,10 +9312,14 @@ class ComputePage(BasePage):
                 self.pb.start(12)
                 if hasattr(self, "btn_run"):
                     self.btn_run.configure(state="disabled")
+                if hasattr(self, "btn_abort"):
+                    self.btn_abort.configure(state="normal")
             else:
                 self.pb.stop()
                 if hasattr(self, "btn_run"):
-                    self.btn_run.configure(state=("normal" if self.app.ctx.workspace_ok else "disabled"))
+                    self.btn_run.configure(state=("normal" if getattr(self.app.ctx, "workspace_compute_ok", False) else "disabled"))
+                if hasattr(self, "btn_abort"):
+                    self.btn_abort.configure(state="disabled")
             self.update_idletasks()
         except Exception:
             pass
@@ -7219,13 +9345,13 @@ class ComputePage(BasePage):
     def refresh_state(self):
         self._sync_from_state(force=False)
         self._refresh_active_trho_selector()
-        ready_run = self.app.ctx.workspace_ok and (not self.app._job_running)
+        ready_run = bool(getattr(self.app.ctx, "workspace_compute_ok", False)) and (not self.app._job_running)
         try:
             self.btn_run.configure(state=("normal" if ready_run else "disabled"))
         except Exception:
             self.btn_run.state(["!disabled"] if ready_run else ["disabled"])
 
-        if self.app._job_running:
+        if self.app._job_running and str(getattr(self.app, "_active_job_kind", "") or "").upper() == "TRHO":
             self._set_running(True, "Running… (TRHO may take a long time)")
         else:
             self._set_running(False)
@@ -7247,9 +9373,7 @@ class TLAPPage(BasePage):
     def _build(self):
         super()._build()
 
-        root = ttk.Frame(self)
-        root.pack(fill="both", expand=True)
-        root.rowconfigure(2, weight=1)
+        root = self._make_scrollable_body()
         root.columnconfigure(0, weight=1)
 
         self.frm_content = ttk.Frame(root)
@@ -7487,6 +9611,10 @@ class TLAPPage(BasePage):
         self.btn_run = ttk.Button(self._pb_row, text="Run TLAP", command=self._run_tlap_placeholder)
         self.btn_run.grid(row=0, column=1, sticky="e", padx=(12, 0), pady=0)
 
+        self.btn_abort = ttk.Button(self._pb_row, text="Abort", command=lambda: self.app.abort_current_job("TLAP"))
+        self.btn_abort.grid(row=0, column=2, sticky="e", padx=(8, 0), pady=0)
+        self.btn_abort.configure(state="disabled")
+
         self._runtime_row = ttk.Frame(parent)
         self._runtime_row.pack(fill="x", pady=(0, 0))
         self._runtime_row.columnconfigure(0, weight=1)
@@ -7659,7 +9787,7 @@ class TLAPPage(BasePage):
         def _cell_entry(col, row, var, width=7, padx=(0, 12)):
             ttk.Entry(grid, textvariable=var, width=width).grid(row=row, column=col, sticky="w", padx=padx, pady=2)
 
-        # Left block (same columns for both rows)
+
         _cell_label(0, 0, "IMETH")
         _cell_entry(1, 0, vars_["IMETH"])
         _cell_label(2, 0, "IEXT")
@@ -7678,11 +9806,11 @@ class TLAPPage(BasePage):
         _cell_label(6, 1, "ITYPE")
         _cell_entry(7, 1, vars_["ITYPE"], padx=(0, 14))
 
-        # Vertical divider spanning both rows
+
         sep = ttk.Separator(grid, orient="vertical")
         sep.grid(row=0, column=8, rowspan=2, sticky="ns", padx=(6, 16), pady=0)
 
-        # Right block (NT / NP) on first row only
+
         _cell_label(9, 0, "NT")
         _cell_entry(10, 0, vars_["NT"], padx=(0, 12))
         _cell_label(11, 0, "NP")
@@ -7766,7 +9894,7 @@ class TLAPPage(BasePage):
             gui_rstar = float(str(cfg.get("RSTAR", "0.0") or "0.0").replace(",", "."))
         except Exception:
             gui_rstar = 0.0
-        # Positive GUI RSTAR acts as a global override; no per-element prompting needed.
+
         if gui_rstar > 0:
             return {}
 
@@ -7848,10 +9976,14 @@ class TLAPPage(BasePage):
                 self.pb.start(12)
                 if hasattr(self, "btn_run"):
                     self.btn_run.configure(state="disabled")
+                if hasattr(self, "btn_abort"):
+                    self.btn_abort.configure(state="normal")
             else:
                 self.pb.stop()
                 if hasattr(self, "btn_run"):
                     self.btn_run.configure(state=("normal" if self.app._tlap_ready() else "disabled"))
+                if hasattr(self, "btn_abort"):
+                    self.btn_abort.configure(state="disabled")
             self.update_idletasks()
         except Exception:
             pass
@@ -7912,7 +10044,7 @@ class TLAPPage(BasePage):
         ready_run = self.app._tlap_ready()
         self.btn_run.state(["!disabled"] if ready_run else ["disabled"])
 
-        if self.app._job_running:
+        if self.app._job_running and str(getattr(self.app, "_active_job_kind", "") or "").upper() == "TLAP":
             self._set_running(True, "Running… (TLAP may take a long time)")
         else:
             self._set_running(False)
@@ -7944,22 +10076,20 @@ class PL2DPage(BasePage):
 
     def _build(self):
         ttk.Label(self, text="PL2D (Slices) — region + isosurfaces", font=("TkDefaultFont", 12, "bold")).pack(anchor="w", padx=14, pady=(14, 8))
+        ttk.Separator(self).pack(fill="x", padx=14, pady=(0, 8))
 
-        body = ttk.Frame(self)
-        body.pack(fill="both", expand=True, padx=14, pady=8)
+        outer, canvas, vbar, body = _make_scrollable_frame(self)
+        outer.pack(fill="both", expand=True, padx=14, pady=8)
+        self._scroll_outer = outer
+        self._scroll_canvas = canvas
+        self._scroll_vbar = vbar
+        self._scroll_inner = body
 
-        # --- XY square region ---
+
         frm_xy = ttk.LabelFrame(body, text="XY square region (Å)")
         frm_xy.pack(fill="x", pady=(0, 10))
 
-        # Region modes (requested):
-        # - Min+L: user provides x_min, y_min, L
-        # - Min/Max: user provides x_min, x_max, y_min, y_max (we keep square)
-        # - Center+L: user provides x_center, y_center, L
-        # - Atom+L: center on an atom label + L
-        # - BCP+L: center on a BCP id + L
-        # - RCP+L: center on a RCP id + L
-        # - CCP+L: center on a CCP id + L
+
         self.var_xy_mode = tk.StringVar(value="Min+L")
 
         self.var_xmin = tk.StringVar(value="0.0")
@@ -7972,7 +10102,7 @@ class PL2DPage(BasePage):
         self.var_ref_kind = tk.StringVar(value="Atom")
         self.var_ref_id = tk.StringVar(value="1")
 
-        # --- Row A: Mode + x/y (min or center) + L + xy_inc ---
+
         rowA = ttk.Frame(frm_xy)
         rowA.pack(fill="x", padx=10, pady=(8, 4))
 
@@ -7986,10 +10116,10 @@ class PL2DPage(BasePage):
         )
         self.cmb_xy_mode.pack(side="left", padx=(0, 14))
         self.cmb_xy_mode.bind("<<ComboboxSelected>>", lambda *_: self._on_xy_mode())
-        # Also react to programmatic changes (e.g., restoring saved configs)
+
         self.var_xy_mode.trace_add("write", lambda *_: self._on_xy_mode())
 
-        # These entries switch meaning between x_min/y_min and x_center/y_center.
+
         self.ent_x1 = _labeled_entry(rowA, "x_min", self.var_xmin, width=12)
         self.ent_x1.pack(side="left", padx=(0, 10))
         self.ent_y1 = _labeled_entry(rowA, "y_min", self.var_ymin, width=12)
@@ -7999,7 +10129,7 @@ class PL2DPage(BasePage):
         self.ent_inc = _labeled_entry(rowA, "xy_inc", self.var_inc, width=12)
         self.ent_inc.pack(side="left", padx=(0, 10))
 
-        # --- Row B: x_max / y_max (only meaningful for Min/Max) ---
+
         rowB = ttk.Frame(frm_xy)
         rowB.pack(fill="x", padx=10, pady=(0, 6))
         self.ent_x2 = _labeled_entry(rowB, "x_max", self.var_xmax, width=12)
@@ -8007,7 +10137,7 @@ class PL2DPage(BasePage):
         self.ent_y2 = _labeled_entry(rowB, "y_max", self.var_ymax, width=12)
         self.ent_y2.pack(side="left", padx=(0, 10))
 
-        # --- Z + slices ---
+
         frm_z = ttk.LabelFrame(body, text="Z range + slices")
         frm_z.pack(fill="x", pady=(0, 10))
 
@@ -8016,7 +10146,7 @@ class PL2DPage(BasePage):
         self.var_zmin = tk.StringVar(value="0.0")
         self.var_zmax = tk.StringVar(value="5.0")
         self.var_zc = tk.StringVar(value="0.0")
-        self.var_Lz = tk.StringVar(value="5.0")
+        self.var_Lz = tk.StringVar(value="2.0")
 
         rowz = ttk.Frame(frm_z)
         rowz.pack(fill="x", padx=10, pady=(8, 4))
@@ -8030,7 +10160,7 @@ class PL2DPage(BasePage):
         )
         self.cmb_z_mode.pack(side="left", padx=(0, 14))
         self.cmb_z_mode.bind("<<ComboboxSelected>>", lambda *_: self._on_z_mode())
-        # Also react to programmatic changes (e.g., restoring saved configs)
+
         self.var_z_mode.trace_add("write", lambda *_: self._on_z_mode())
 
         self.ent_z1 = _labeled_entry(rowz, "z_min", self.var_zmin, width=12)
@@ -8042,7 +10172,7 @@ class PL2DPage(BasePage):
         self.ent_Lz = _labeled_entry(rowz, "Lz", self.var_Lz, width=12)
         self.ent_Lz.pack(side="left", padx=(0, 10))
 
-        # n_slices presets + custom
+
         self.var_slice_mode = tk.StringVar(value="50")
         self.var_slice_custom = tk.StringVar(value="50")
 
@@ -8058,7 +10188,7 @@ class PL2DPage(BasePage):
         self.lbl_slice_hint = ttk.Label(frm_z, text="Limits: min 10, max 200.", foreground="#444")
         self.lbl_slice_hint.pack(anchor="w", padx=12, pady=(0, 6))
 
-        # Shared center target for both XY and Z center-based modes
+
         frm_center = ttk.LabelFrame(body, text="Center target for XY and/or Z")
         frm_center.pack(fill="x", pady=(0, 10))
 
@@ -8085,7 +10215,7 @@ class PL2DPage(BasePage):
         self.lbl_xy_summary = ttk.Label(frm_center, text="", foreground="#444")
         self.lbl_xy_summary.pack(anchor="w", padx=12, pady=(0, 10))
 
-        # --- Isosurface types ---
+
         frm_iso = ttk.LabelFrame(body, text="Isosurface types (.DAT)")
         frm_iso.pack(fill="x", pady=(0, 10))
 
@@ -8095,31 +10225,35 @@ class PL2DPage(BasePage):
 
         grid = ttk.Frame(frm_iso)
         grid.pack(fill="x", padx=10, pady=8)
+        for col in range(3):
+            grid.columnconfigure(col, weight=1, uniform="iso_cols")
 
-        # All isosurfaces toggle
+
         ttk.Checkbutton(
             grid,
-            text="All isosurfaces",
+            text="All Isosurfaces",
             variable=self.var_all_iso,
             command=self._toggle_all_isosurfaces,
-        ).grid(row=0, column=0, sticky="w", padx=(0, 12), pady=(0, 6))
+        ).grid(row=0, column=0, columnspan=3, sticky="w", padx=(0, 12), pady=(0, 8))
 
         for i, (key, label) in enumerate(self.ISO_TYPES):
             var = tk.BooleanVar(value=(key == "SURFRHOO"))
             self.iso_vars[key] = var
             cb = ttk.Checkbutton(grid, text=f"{key} — {label}", variable=var, command=self._on_iso_changed)
-            cb.grid(row=1 + (i // 2), column=i % 2, sticky="w", padx=(0, 12), pady=2)
+            row = 1 + (i // 3)
+            col = i % 3
+            cb.grid(row=row, column=col, sticky="w", padx=(0, 12), pady=2)
 
-        # If all are selected at startup, reflect it (normally false because only SURFRHOO starts checked)
+
         self._sync_all_isosurfaces_var()
 
-# --- Actions ---
+
         frm_act = ttk.Frame(body)
         frm_act.pack(fill="x", pady=(2, 0))
         frm_act.columnconfigure(0, weight=3)
         frm_act.columnconfigure(1, weight=2, minsize=390)
 
-        # Left side: optional project name chosen by the user.
+
         frm_project = ttk.LabelFrame(frm_act, text="PL2D project name")
         frm_project.grid(row=0, column=0, sticky="new", padx=(0, 12), pady=(0, 2))
         frm_project.columnconfigure(0, weight=1)
@@ -8131,12 +10265,11 @@ class PL2DPage(BasePage):
             frm_project,
             text="Optional. Leave blank to use the automatic TopIso3D name.",
             foreground="#444",
-            wraplength=520,
+            wraplength=420,
             justify="left",
         ).grid(row=1, column=0, sticky="w", padx=10, pady=(0, 6))
 
-        # Right side: execution controls.
-        # Use a grid with reserved width so the progress text does not expand over the project-name box.
+
         frm_run = ttk.Frame(frm_act)
         frm_run.grid(row=0, column=1, sticky="new", pady=(2, 0))
         frm_run.columnconfigure(0, weight=0, minsize=320)
@@ -8150,20 +10283,30 @@ class PL2DPage(BasePage):
             command=self._on_params_changed,
         ).grid(row=0, column=0, columnspan=2, sticky="w")
 
-        self.btn_run = ttk.Button(frm_run, text="Run PL2D", command=self._run_pl2d)
-        self.btn_run.grid(row=1, column=0, sticky="w", pady=(6, 0))
+        btns_run = ttk.Frame(frm_run)
+        btns_run.grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
-        # Progress (per-slice)
+        self.btn_run = ttk.Button(btns_run, text="Run PL2D", command=self._run_pl2d)
+        self.btn_run.pack(side="left")
+
+        self.btn_export_campaign = ttk.Button(
+            btns_run,
+            text="Export campaign",
+            command=self._export_pl2d_campaign,
+        )
+        self.btn_export_campaign.pack(side="left", padx=(8, 0))
+
+
         self.pb = ttk.Progressbar(frm_run, orient="horizontal", mode="determinate", length=320)
         self.pb.grid(row=2, column=0, sticky="ew", pady=(8, 0))
-        # Progress text (e.g., Done (12/100)) keeps a reserved column, preventing overlap with the left frame.
+
         self.lbl_pb = ttk.Label(frm_run, text="", width=12, anchor="w")
         self.lbl_pb.grid(row=2, column=1, sticky="w", padx=(10, 0), pady=(8, 0))
 
         self.lbl_status = ttk.Label(frm_run, text="▶ PL2D not run", font=("TkDefaultFont", 10, "bold"))
         self.lbl_status.grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
-        # Bind changes
+
         for var in (
             self.var_xy_mode, self.var_xmin, self.var_ymin, self.var_xmax, self.var_ymax, self.var_L, self.var_inc,
             self.var_ref_kind, self.var_ref_id,
@@ -8178,23 +10321,42 @@ class PL2DPage(BasePage):
         self._on_params_changed()
         self.refresh()
 
+    def _on_close(self):
+        """Close Reports Viewer cleanly without leaving stale references/callbacks."""
+        try:
+            if getattr(self.app, "_report_viewer_win", None) is self:
+                self.app._report_viewer_win = None
+        except Exception:
+            pass
+        try:
+            self.destroy()
+        except Exception:
+            pass
+
     def refresh(self):
-        # Enable only if workspace is ready and TRHO is available/parsed
-        ready = self.app.state.workspace_ok and self.app.state.trho_parsed is not None
-        # While running, keep a clear status message
+
+        ready = bool(getattr(self.app.state, "workspace_compute_ok", False)) and self.app.state.trho_parsed is not None
+
         if getattr(self.app.state, 'pl2d_running', False):
             self.lbl_status.configure(text='⏳ PL2D running…')
             self.btn_run.configure(state='disabled')
+            if hasattr(self, "btn_export_campaign"):
+                self.btn_export_campaign.configure(state='disabled')
             return
 
         self.btn_run.configure(state=("normal" if ready else "disabled"))
+        if hasattr(self, "btn_export_campaign"):
+            self.btn_export_campaign.configure(state=("normal" if ready else "disabled"))
 
-        if not self.app.state.workspace_ok:
-            self.lbl_status.configure(text="▶ Choose a workspace first")
+        if not getattr(self.app.state, "workspace_compute_ok", False):
+            if getattr(self.app.state, "workspace_import_only", False):
+                self.lbl_status.configure(text="▶ Import-only workspace: PL2D requires fort.9 or *.f9/*.9")
+            else:
+                self.lbl_status.configure(text="▶ Choose a workspace with fort.9 or *.f9/*.9 first")
         elif self.app.state.trho_parsed is None:
             self.lbl_status.configure(text="▶ Run/parse TRHO first")
         else:
-            # Status based on detection
+
             self._update_existing_detection()
 
     def _on_slice_mode(self):
@@ -8239,14 +10401,14 @@ class PL2DPage(BasePage):
             xmin = xc - L / 2.0
             ymin = yc - L / 2.0
 
-        # Snap L to grid so Nx == Ny always
+
         N = int(round(L / inc)) + 1
         if N < 2:
             N = 2
         L_eff = (N - 1) * inc
         if not self.var_snap.get():
-            # Without snapping, we still enforce Nx==Ny but don't modify L in UI;
-            # x_max/y_max will use L_eff anyway to keep the grid consistent.
+
+
             pass
         xmax = xmin + L_eff
         ymax = ymin + L_eff
@@ -8269,13 +10431,13 @@ class PL2DPage(BasePage):
         return zmin, zmax
 
     def _on_xy_mode(self):
-        # Always trust what the user sees in the combobox (avoids state desync)
+
         try:
             mode = (self.cmb_xy_mode.get() or self.var_xy_mode.get() or "Min+L").strip()
         except Exception:
             mode = (self.var_xy_mode.get() or "Min+L").strip()
 
-        # Update label text for the first two fields (min vs center).
+
         want_center = mode in ("Center+L", "Atom+L", "BCP+L", "RCP+L", "CCP+L", "NNA+L")
         try:
             getattr(self.ent_x1, "_lbl").configure(text=("x_center" if want_center else "x_min"))
@@ -8283,28 +10445,27 @@ class PL2DPage(BasePage):
         except Exception:
             pass
 
-        # Enable/disable fields based on mode (UX: guide the user).
+
         is_minmax = (mode == "Min/Max")
         is_center_manual = (mode == "Center+L")
         is_auto_center = mode in ("Atom+L", "BCP+L", "RCP+L", "CCP+L", "NNA+L")
         is_minL = (mode == "Min+L")
 
-        # x_min/y_min or x_center/y_center:
-        # - enabled in manual modes; disabled in auto-center modes
+
         _set_labeled_state(self.ent_x1, enabled=(not is_auto_center))
         _set_labeled_state(self.ent_y1, enabled=(not is_auto_center))
 
-        # x_max/y_max only for Min/Max
+
         _set_labeled_state(self.ent_x2, enabled=is_minmax)
         _set_labeled_state(self.ent_y2, enabled=is_minmax)
 
-        # L is used in Min+L, Center+L, Atom+L, BCP+L (not in Min/Max)
+
         _set_labeled_state(self.ent_L, enabled=(not is_minmax))
 
-        # xy_inc always used
+
         _set_labeled_state(self.ent_inc, enabled=True)
 
-        # Target center controls enabled only for Atom/BCP modes
+
         if is_auto_center:
             self.cmb_ref_kind.configure(state="readonly")
             self.ent_ref_id.configure(state="normal")
@@ -8333,14 +10494,13 @@ class PL2DPage(BasePage):
         is_minmax = (mode == "Min/Max")
         is_auto_center = mode in ("Atom+L", "BCP+L", "RCP+L", "CCP+L", "NNA+L")
 
-        # In Min/Max: z_min/z_max enabled, z_center/Lz disabled
+
         _set_labeled_state(self.ent_z1, enabled=is_minmax)
         _set_labeled_state(self.ent_z2, enabled=is_minmax)
         _set_labeled_state(self.ent_zc, enabled=(not is_minmax and not is_auto_center))
         _set_labeled_state(self.ent_Lz, enabled=(not is_minmax))
 
-        # Share the same target selector used for XY auto-centering.
-        # If Z is in an auto-center mode, keep the selector aligned with that mode.
+
         if is_auto_center:
             self.cmb_ref_kind.configure(state="readonly")
             self.ent_ref_id.configure(state="normal")
@@ -8358,7 +10518,7 @@ class PL2DPage(BasePage):
             elif mode == "NNA+L":
                 self.var_ref_kind.set("NNA")
         else:
-            # Only disable the shared target controls when XY also does not use them.
+
             try:
                 xy_mode = (self.var_xy_mode.get() or "Min+L").strip()
             except Exception:
@@ -8379,7 +10539,7 @@ class PL2DPage(BasePage):
             - RCP/CCP coordinates live in parsed TRHO tables (df_rcp_props / df_ccp_props) and may also be cached in app.state.
           - In center modes, the GUI stores x_center/y_center inside var_xmin/var_ymin (labels change dynamically).
         """
-        # Need TRHO parsed/loaded
+
         if self.app.state.trho_parsed is None and getattr(self.app.state, "df_true_atoms", None) is None:
             return
 
@@ -8388,7 +10548,7 @@ class PL2DPage(BasePage):
         if not rid:
             return
 
-        # parse integer id from user input
+
         m = re.search(r"(\d+)", rid)
         if not m:
             return
@@ -8406,10 +10566,10 @@ class PL2DPage(BasePage):
             raise KeyError("No XYZ columns found")
 
         def _set_center(xc, yc, zc):
-            # Apply only to dimensions currently using center-based modes.
+
             xy_mode = (self.var_xy_mode.get() or "Min+L").strip()
             if xy_mode in ("Center+L", "Atom+L", "BCP+L", "RCP+L", "CCP+L", "NNA+L"):
-                # In center modes, x_center/y_center are stored in var_xmin/var_ymin
+
                 self.var_xmin.set(f"{xc:.6f}")
                 self.var_ymin.set(f"{yc:.6f}")
             z_mode = (self.var_z_mode.get() or "Min/Max").strip()
@@ -8579,7 +10739,7 @@ class PL2DPage(BasePage):
         return cfg
 
     def _signature(self, cfg: dict) -> str:
-        # Only what defines the grid and outputs
+
         import hashlib, json as _json
         payload = {
             "xmin": round(cfg["xmin"], 12),
@@ -8621,7 +10781,7 @@ class PL2DPage(BasePage):
         return None
 
     def _validate_run(self, run_dir: Path, cfg: dict) -> bool:
-        # minimal sanity: for each expected slice, ensure at least one selected .DAT exists
+
         ns = int(cfg["n_slices"])
         iso = cfg["iso"]
         for i in range(ns):
@@ -8634,7 +10794,7 @@ class PL2DPage(BasePage):
         return True
 
     def _on_params_changed(self):
-        # Update computed summary + detection
+
         try:
             cfg = self._build_config()
             xmin, xmax, ymin, ymax, inc, N, L_in, L_eff = self._compute_xy()
@@ -8654,7 +10814,7 @@ class PL2DPage(BasePage):
             self.app.state.pl2d_signature = None
 
     def _update_existing_detection(self):
-        if not (self.app.state.workspace_ok and self.app.state.trho_parsed is not None):
+        if not (getattr(self.app.state, "workspace_compute_ok", False) and self.app.state.trho_parsed is not None):
             return
         cfg = getattr(self.app.state, "pl2d_cfg", None)
         sig = getattr(self.app.state, "pl2d_signature", None)
@@ -8679,64 +10839,336 @@ class PL2DPage(BasePage):
             self.app.state.pl2d_run_dir = None
             self.lbl_status.configure(text="▶ PL2D not run")
 
-    def _run_pl2d(self):
-        log_event(self.app.ctx, 'PL2D started')
-        # Mark as running so UI doesn't show 'not run' while slices are being generated
-        self.app.state.pl2d_running = True
-        self.lbl_status.configure(text='⏳ PL2D running…')
-        self.btn_run.configure(state='disabled')
-        """Run PL2D using CRYSTAL properties (same default input logic as v2).
 
-        Creates a run directory under workspace/pl2d_runs/ and generates sliceXXX folders,
-        each containing pl2d.inp, pl2d.out and the selected *.DAT files produced by properties.
-        """
-        if not (self.app.state.workspace_ok and self.app.state.trho_parsed is not None):
-            messagebox.showwarning("PL2D", "Run/parse TRHO first.")
-            return
+def _create_pl2d_run_dir(self, root: Path, cfg: dict, sig: str) -> tuple[str, Path]:
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    user_project_name = str(cfg.get("project_name") or "").strip() if bool(cfg.get("project_name_custom", False)) else ""
+    if user_project_name:
+        base_run_name = self._safe_project_slug(user_project_name) or "PL2D"
+        run_name = base_run_name
+        run_dir = root / run_name
+        counter = 2
+        while run_dir.exists():
+            run_name = f"{base_run_name}_{counter}"
+            run_dir = root / run_name
+            counter += 1
+    else:
+        run_name = f"{sig[:10]}_{cfg['n_slices']:03d}_{ts}"
+        run_dir = root / run_name
+    run_dir.mkdir(parents=True, exist_ok=False)
+    return ts, run_dir
+
+def _compute_pl2d_zs(self, cfg: dict) -> list[float]:
+    ns = int(cfg["n_slices"])
+    zmin = float(cfg["zmin"])
+    zmax = float(cfg["zmax"])
+    if ns <= 0:
+        return [zmin]
+    dz = (zmax - zmin) / ns
+    return [zmin + i * dz for i in range(ns + 1)]
+
+def _pl2d_flags_line(self, cfg: dict) -> str:
+    iso_set = set(cfg["iso"])
+    flags = [
+        1 if "SURFRHOO" in iso_set else 0,
+        1 if "SURFSPDE" in iso_set else 0,
+        1 if "SURFLAPP" in iso_set else 0,
+        1 if "SURFLAPM" in iso_set else 0,
+        1 if "SURFGRHO" in iso_set else 0,
+        1 if "SURFKKIN" in iso_set else 0,
+        1 if "SURFGKIN" in iso_set else 0,
+        1 if "SURFVIRI" in iso_set else 0,
+        1 if "SURFELFB" in iso_set else 0,
+        0, 0, 0,
+    ]
+    return ",".join(str(x) for x in flags)
+
+def _write_pl2d_input_for_slice(self, sdir: Path, z: float, cfg: dict, *, out_name: str) -> Path:
+    bohr_to_ang = float(getattr(self.app.state, "bohr_to_ang", 0.5291772083))
+    a_coord = (0.0, 0.0)
+    b_coord = (1.0, 0.0)
+    c_coord = (0.0, 1.0)
+    xmin = float(cfg["xmin"])
+    xmax = float(cfg["xmax"])
+    ymin = float(cfg["ymin"])
+    ymax = float(cfg["ymax"])
+    inc = float(cfg["inc"])
+    flags_line = self._pl2d_flags_line(cfg)
+    inp = sdir / "pl2d.inp"
+    with open(inp, "w", encoding="utf-8") as f:
+        pl2d_text = (
+            "TOPO\n"
+            "PL2D\n"
+            "0\n"
+            f"{a_coord[0]/bohr_to_ang} {a_coord[1]/bohr_to_ang} {z/bohr_to_ang}\n"
+            "0\n"
+            f"{b_coord[0]/bohr_to_ang} {b_coord[1]/bohr_to_ang} {z/bohr_to_ang}\n"
+            "0\n"
+            f"{c_coord[0]/bohr_to_ang} {c_coord[1]/bohr_to_ang} {z/bohr_to_ang}\n"
+            "3\n"
+            "0\n"
+            "30,15.0\n"
+            "1\n"
+            f"{xmin} {xmax} {inc}\n"
+            f"{ymin} {ymax} {inc}\n"
+            f"{flags_line}\n"
+            f"{out_name}\n"
+            "1\n"
+            "2.,0.0,0\n"
+            "2.2,1,1,1\n"
+            "36,0\n"
+            "END\n"
+        )
+        f.write(pl2d_text)
+    return inp
+
+
+def _write_pl2d_unix_scripts(self, run_dir: Path, cfg: dict) -> None:
+    slice_dirs = sorted([p.name for p in run_dir.iterdir() if p.is_dir() and p.name.startswith("slice")])
+    dat_names = []
+    for key in cfg.get("iso", []):
+        dat_name = f"{key}.DAT"
+        if dat_name not in dat_names:
+            dat_names.append(dat_name)
+    dat_glob = " ".join(dat_names) if dat_names else "*.DAT"
+
+    max_index = max(0, len(slice_dirs) - 1)
+    jobs_default = min(10, max(1, len(slice_dirs))) if slice_dirs else 1
+    local_platform = get_platform_name()
+
+    run_all = textwrap.dedent(f"""        #!/usr/bin/env bash
+        set -euo pipefail
+
+        ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+        PROPERTIES_EXE="${{PROPERTIES_EXE:-properties}}"
+        FORT9_SOURCE="${{FORT9_SOURCE:-$ROOT_DIR/fort.9}}"
+        MODULE_LOAD_CMD="${{MODULE_LOAD_CMD:-}}"
+
+        if [[ -n "$MODULE_LOAD_CMD" ]]; then
+          eval "$MODULE_LOAD_CMD"
+        fi
+
+        if [[ ! -f "$FORT9_SOURCE" ]]; then
+          echo "fort.9 not found. Place fort.9 in the campaign root or set FORT9_SOURCE." >&2
+          exit 1
+        fi
+
+        for d in "$ROOT_DIR"/slice*; do
+          [[ -d "$d" ]] || continue
+          cp -f "$FORT9_SOURCE" "$d/fort.9"
+          (
+            cd "$d"
+            "$PROPERTIES_EXE" < pl2d.inp > pl2d.out 2> pl2d.err
+            rm -f fort.9 fort.3 fort.11 fort.13
+          )
+        done
+
+        echo "PL2D campaign finished. Expected data files: {dat_glob}"
+        """)
+
+    run_parallel = textwrap.dedent(f"""        #!/usr/bin/env bash
+        set -euo pipefail
+
+        ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+        PROPERTIES_EXE="${{PROPERTIES_EXE:-properties}}"
+        FORT9_SOURCE="${{FORT9_SOURCE:-$ROOT_DIR/fort.9}}"
+        MODULE_LOAD_CMD="${{MODULE_LOAD_CMD:-}}"
+        JOBS="${{JOBS:-{jobs_default}}}"
+
+        if [[ -n "$MODULE_LOAD_CMD" ]]; then
+          eval "$MODULE_LOAD_CMD"
+        fi
+
+        if [[ ! -f "$FORT9_SOURCE" ]]; then
+          echo "fort.9 not found. Place fort.9 in the campaign root or set FORT9_SOURCE." >&2
+          exit 1
+        fi
+
+        export ROOT_DIR PROPERTIES_EXE FORT9_SOURCE
+        find "$ROOT_DIR" -maxdepth 1 -type d -name 'slice*' | sort | xargs -I{{}} -P "$JOBS" bash -c '
+          d="$1"
+          cp -f "$FORT9_SOURCE" "$d/fort.9"
+          cd "$d"
+          "$PROPERTIES_EXE" < pl2d.inp > pl2d.out 2> pl2d.err
+          rm -f fort.9 fort.3 fort.11 fort.13
+        ' _ {{}}
+
+        echo "PL2D parallel campaign finished. Expected data files: {dat_glob}"
+        """)
+
+    submit_slurm = textwrap.dedent(f"""        #!/usr/bin/env bash
+        #SBATCH --job-name=pl2d_campaign
+        #SBATCH --output=slurm_%A_%a.out
+        #SBATCH --error=slurm_%A_%a.err
+        #SBATCH --array=0-{max_index}%{jobs_default}
+        #SBATCH --ntasks=1
+        #SBATCH --cpus-per-task=1
+
+        set -euo pipefail
+        ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+        PROPERTIES_EXE="${{PROPERTIES_EXE:-properties}}"
+        FORT9_SOURCE="${{FORT9_SOURCE:-$ROOT_DIR/fort.9}}"
+        MODULE_LOAD_CMD="${{MODULE_LOAD_CMD:-module load crystal}}"
+        SLICE_DIR=$(printf "%s/slice%03d" "$ROOT_DIR" "$SLURM_ARRAY_TASK_ID")
+
+        if [[ -n "$MODULE_LOAD_CMD" ]]; then
+          eval "$MODULE_LOAD_CMD"
+        fi
+
+        if [[ ! -d "$SLICE_DIR" ]]; then
+          echo "Missing slice directory: $SLICE_DIR" >&2
+          exit 1
+        fi
+        if [[ ! -f "$FORT9_SOURCE" ]]; then
+          echo "fort.9 not found. Place fort.9 in the campaign root or set FORT9_SOURCE." >&2
+          exit 1
+        fi
+
+        cp -f "$FORT9_SOURCE" "$SLICE_DIR/fort.9"
+        cd "$SLICE_DIR"
+        "$PROPERTIES_EXE" < pl2d.inp > pl2d.out 2> pl2d.err
+        rm -f fort.9 fort.3 fort.11 fort.13
+        """)
+
+    cleanup_for_return = textwrap.dedent("""        #!/usr/bin/env bash
+        set -euo pipefail
+
+        ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+        echo "Cleaning PL2D campaign for return/export from: $ROOT_DIR"
+
+        # Remove per-slice temporary files created only for execution.
+        for d in "$ROOT_DIR"/slice*; do
+          [[ -d "$d" ]] || continue
+          rm -f "$d"/fort.9 "$d"/fort.* "$d"/*.LOG "$d"/INPUT
+        done
+
+        # Remove root-level execution leftovers that are usually not needed back in TopIso3D.
+        rm -f "$ROOT_DIR"/fort.9
+        rm -f "$ROOT_DIR"/slurm-*.out "$ROOT_DIR"/slurm-*.err
+        rm -f "$ROOT_DIR"/slurm_*.out "$ROOT_DIR"/slurm_*.err
+
+        echo "Cleanup finished."
+        echo "Kept files per slice: pl2d.inp, pl2d.out, pl2d.err, *.DAT"
+        """)
+
+    readme_run = textwrap.dedent(f"""        TopIso3D PL2D campaign
+        ======================
+
+        Local platform used to export this campaign: {local_platform}
+        Run directory: {run_dir.name}
+        Number of slices: {len(slice_dirs)}
+        Slice folders: slice000 ... slice{max_index:03d}
+
+        Files included
+        --------------
+        - manifest.json
+        - fort.9
+        - sliceXXX/pl2d.inp
+        - run_all.sh
+        - run_parallel.sh
+        - submit_slurm.sh
+        - cleanup_for_return.sh
+
+        Recommended usage
+        -----------------
+        1) Windows:
+           Generate the campaign locally, transfer the whole folder to a Linux/macOS
+           machine or cluster, and execute the shell scripts there.
+
+        2) Linux/macOS local execution:
+           chmod +x run_all.sh run_parallel.sh cleanup_for_return.sh
+           bash run_all.sh
+
+        3) Linux/macOS parallel local execution:
+           chmod +x run_parallel.sh
+           JOBS={jobs_default} bash run_parallel.sh
+
+        4) Slurm cluster execution:
+           chmod +x submit_slurm.sh
+           sbatch submit_slurm.sh
+
+        Environment notes
+        -----------------
+        - The scripts expect a CRYSTAL/TOPOND properties executable.
+        - By default they call: properties
+        - You can override it with:
+              PROPERTIES_EXE=/full/path/to/properties bash run_all.sh
+        - For cluster environments that require module loading, use:
+              MODULE_LOAD_CMD="module load crystal" sbatch submit_slurm.sh
+          The exported Slurm script already defaults to that module-load pattern.
+
+        fort.9 handling
+        ---------------
+        - fort.9 must be present in the campaign root.
+        - Each slice receives a temporary copy of fort.9 before execution.
+        - Temporary fort.* files created during execution are removed automatically.
+
+        Return / back-export
+        --------------------
+        After the campaign finishes, you can reduce the amount of transferred files with:
+            chmod +x cleanup_for_return.sh
+            bash cleanup_for_return.sh
+
+        This cleanup keeps, inside each slice:
+        - pl2d.inp
+        - pl2d.out
+        - pl2d.err
+        - {dat_glob}
+
+        Important
+        ---------
+        This campaign was generated to be OS-agnostic at the preparation level.
+        Shell execution itself must be performed on a Unix-like environment
+        (Linux, macOS, or a Linux cluster).
+        """)
+
+    for name, content in {
+        "run_all.sh": run_all,
+        "run_parallel.sh": run_parallel,
+        "submit_slurm.sh": submit_slurm,
+        "cleanup_for_return.sh": cleanup_for_return,
+        "README_RUN.txt": readme_run,
+    }.items():
+        path = run_dir / name
+        path.write_text(content, encoding="utf-8")
         try:
-            cfg = self._build_config()
-        except Exception as e:
-            messagebox.showerror("PL2D", f"Invalid configuration: {e}")
-            return
+            path.chmod(0o755)
+        except Exception:
+            pass
 
-        ctx = self.app.state
-        prop_exe = getattr(ctx, "properties_exe", None)
-        exe_path = resolve_executable(str(prop_exe) if prop_exe is not None else None)
-        if not exe_path:
-            messagebox.showerror("PL2D", f"properties executable not found: {prop_exe}")
-            return
 
-        # Require fort.9
-        fort9_src = None
-        if ctx.workspace_dir:
-            cand = ctx.workspace_dir / "fort.9"
-            if cand.exists():
-                fort9_src = cand
-        if fort9_src is None:
-            messagebox.showerror("PL2D", "fort.9 not found in workspace. Make sure the workspace has fort.9 first.")
-            return
+def _export_pl2d_campaign(self):
+    """Phase 2: generate a full PL2D campaign without executing properties locally."""
+    if not (getattr(self.app.state, "workspace_compute_ok", False) and self.app.state.trho_parsed is not None):
+        messagebox.showwarning("PL2D", "PL2D requires a parsed TRHO result and fort.9 or *.f9/*.9 in the workspace.")
+        return
 
-        sig = self._signature(cfg)
-        root = self._runs_root()
-        root.mkdir(parents=True, exist_ok=True)
+    try:
+        cfg = self._build_config()
+    except Exception as e:
+        messagebox.showerror("PL2D", f"Invalid configuration: {e}")
+        return
 
-        ts = time.strftime("%Y%m%d_%H%M%S")
-        user_project_name = str(cfg.get("project_name") or "").strip() if bool(cfg.get("project_name_custom", False)) else ""
-        if user_project_name:
-            base_run_name = self._safe_project_slug(user_project_name) or "PL2D"
-            run_name = base_run_name
-            run_dir = root / run_name
-            counter = 2
-            while run_dir.exists():
-                run_name = f"{base_run_name}_{counter}"
-                run_dir = root / run_name
-                counter += 1
-        else:
-            run_name = f"{sig[:10]}_{cfg['n_slices']:03d}_{ts}"
-            run_dir = root / run_name
-        run_dir.mkdir(parents=True, exist_ok=False)
+    ctx = self.app.state
+    fort9_src = None
+    if ctx.workspace_dir:
+        cand = ctx.workspace_dir / "fort.9"
+        if cand.exists():
+            fort9_src = cand
+    if fort9_src is None:
+        messagebox.showerror("PL2D", "fort.9 not found in workspace. Make sure the workspace has fort.9 first.")
+        return
 
-        # Prepare manifest (robust reuse detection)
+    sig = self._signature(cfg)
+    root = self._runs_root()
+    root.mkdir(parents=True, exist_ok=True)
+
+    try:
+        ts, run_dir = self._create_pl2d_run_dir(root, cfg, sig)
+        zs = self._compute_pl2d_zs(cfg)
+        out_name = str(cfg.get("project_name") or (ctx.workspace_dir.name if ctx.workspace_dir else "PL2D"))
+
         try:
             f9_stat = fort9_src.stat()
             f9_fp = {"size": int(f9_stat.st_size), "mtime": int(f9_stat.st_mtime)}
@@ -8748,196 +11180,325 @@ class PL2DPage(BasePage):
             "created_at": ts,
             "config": cfg,
             "engine": "properties",
-            "properties_exe": str(exe_path),
+            "properties_exe": "properties",
             "project_name": str(cfg.get("project_name", "") or "") if bool(cfg.get("project_name_custom", False)) else "",
             "source": {"fort9": str(fort9_src), "fort9_fp": f9_fp},
-            "status": "running",
+            "execution_mode": "exported",
+            "status": "ready_for_execution",
+            "execution_mode": "exported_campaign",
+            "slice_count": len(zs),
+            "expected_outputs": [f"{key}.DAT" for key in cfg.get("iso", [])],
         }
         (run_dir / "manifest.json").write_text(json.dumps(mf, indent=2), encoding="utf-8")
 
-        # Slice positions along z
-        # In TopIso3D v2, choosing N slices means N intervals and (N+1) slice planes
-        ns = int(cfg["n_slices"])
-        zmin = float(cfg["zmin"])
-        zmax = float(cfg["zmax"])
-        if ns <= 0:
-            zs = [zmin]
-        else:
-            dz = (zmax - zmin) / ns
-            zs = [zmin + i * dz for i in range(ns + 1)]
-
-        # Output flags (order must match v2/default)
-        # rhoo, spde, lapp, lapm, grho, kkin, gkin, viri, elfb, trajg, molg, trajm
-        iso_set = set(cfg["iso"])
-        flags = [
-            1 if "SURFRHOO" in iso_set else 0,
-            1 if "SURFSPDE" in iso_set else 0,
-            1 if "SURFLAPP" in iso_set else 0,
-            1 if "SURFLAPM" in iso_set else 0,
-            1 if "SURFGRHO" in iso_set else 0,
-            1 if "SURFKKIN" in iso_set else 0,
-            1 if "SURFGKIN" in iso_set else 0,
-            1 if "SURFVIRI" in iso_set else 0,
-            1 if "SURFELFB" in iso_set else 0,
-            0, 0, 0,
-        ]
-        flags_line = ",".join(str(x) for x in flags)
-
-        # Plane definition (keep exactly as v2 defaults)
-        bohr_to_ang = float(getattr(ctx, "bohr_to_ang", 0.5291772083))
-        a_coord = (0.0, 0.0)
-        b_coord = (1.0, 0.0)
-        c_coord = (0.0, 1.0)
-
-        # XY ranges in Angstrom (as in v2)
-        xmin = float(cfg["xmin"])
-        xmax = float(cfg["xmax"])
-        ymin = float(cfg["ymin"])
-        ymax = float(cfg["ymax"])
-        inc = float(cfg["inc"])
-
-        # Output/project name: user-defined when provided; otherwise keep the automatic workspace-based name.
-        out_name = str(cfg.get("project_name") or (ctx.workspace_dir.name if ctx.workspace_dir else "PL2D"))
-
-        # Run slices sequentially (safer; avoids spawning 100 processes at once)
-        # IMPORTANT: PL2D uses ONLY the per-page progress bar (self.pb).
-        # Do not update the global statusbar progress here to avoid duplicated progress bars.
-        # Also clear any previously active global task indicator.
-        try:
-            self.app.set_task(active=False)
-        except Exception:
-            pass
-        ok_all = True
-
-        # Init per-page progress bar
-        try:
-            self.pb.configure(maximum=len(zs), value=0)
-            self.lbl_pb.configure(text=f"Slice 0/{len(zs)}")
-            self.update_idletasks()
-        except Exception:
-            pass
+        shutil.copy2(fort9_src, run_dir / "fort.9")
 
         for i, z in enumerate(zs):
             sdir = run_dir / f"slice{i:03d}"
             sdir.mkdir()
+            self._write_pl2d_input_for_slice(sdir, z, cfg, out_name=out_name)
 
-            # Copy fort.9 required by properties
-            try:
-                shutil.copy2(fort9_src, sdir / "fort.9")
-            except Exception as e:
-                ok_all = False
-                self.app._job_queue.put(("log", f"[PL2D] Failed to copy fort.9 to {sdir}: {e}"))
-                break
+        self._write_pl2d_unix_scripts(run_dir, cfg)
 
-            # Write pl2d.inp (same template as v2)
-            inp = sdir / "pl2d.inp"
-            try:
-                with open(inp, "w", encoding="utf-8") as f:
-                    pl2d_text = (
-                        "TOPO\n"
-                        "PL2D\n"
-                        "0\n"
-                        f"{a_coord[0]/bohr_to_ang} {a_coord[1]/bohr_to_ang} {z/bohr_to_ang}\n"
-                        "0\n"
-                        f"{b_coord[0]/bohr_to_ang} {b_coord[1]/bohr_to_ang} {z/bohr_to_ang}\n"
-                        "0\n"
-                        f"{c_coord[0]/bohr_to_ang} {c_coord[1]/bohr_to_ang} {z/bohr_to_ang}\n"
-                        "3\n"
-                        "0\n"
-                        "30,15.0\n"
-                        "1\n"
-                        f"{xmin} {xmax} {inc}\n"
-                        f"{ymin} {ymax} {inc}\n"
-                        f"{flags_line}\n"
-                        f"{out_name}\n"
-                        "1\n"
-                        "2.,0.0,0\n"
-                        "2.2,1,1,1\n"
-                        "36,0\n"
-                        "END\n"
-                    )
-                    f.write(pl2d_text)
-            except Exception as e:
-                ok_all = False
-                self.app._job_queue.put(("log", f"[PL2D] Failed to write pl2d.inp in {sdir}: {e}"))
-                break
+        self.app.state.pl2d_run_dir = run_dir
+        self.lbl_status.configure(text="✔ PL2D campaign exported")
+        self.app.set_status(f"PL2D campaign exported: {run_dir.name}")
+        self.app.refresh_all_pages()
 
-            # Run properties
-            out = sdir / "pl2d.out"
-            try:
-                err = sdir / "pl2d.err"
-                # Run properties (robust I/O capture, avoids shell redirection issues)
-                with open(inp, "r", encoding="utf-8", errors="ignore") as fin,                      open(out, "w", encoding="utf-8") as fout,                      open(err, "w", encoding="utf-8") as ferr:
-                    proc = subprocess.run([str(exe_path)], stdin=fin, stdout=fout, stderr=ferr, cwd=str(sdir))
-                if proc.returncode != 0:
-                    ok_all = False
-                    self.app._job_queue.put(("log", f"[PL2D] properties returned {proc.returncode} on slice {i:03d}"))
-                    try:
-                        if err.exists():
-                            err_txt = err.read_text(errors="ignore")
-                            self.app._job_queue.put(("log", "[PL2D] STDERR:\n" + err_txt[-1000:]))
-                        if out.exists():
-                            out_txt = out.read_text(errors="ignore")
-                            self.app._job_queue.put(("log", "[PL2D] STDOUT tail:\n" + out_txt[-1000:]))
-                    except Exception:
-                        pass
-                    break
-            except Exception as e:
-                ok_all = False
-                self.app._job_queue.put(("log", f"[PL2D] Failed to run properties on slice {i:03d}: {e}"))
-                try:
-                    (sdir / "pl2d.err").write_text("EXCEPTION\n" + str(e) + "\n\n" + traceback.format_exc(), encoding="utf-8")
-                except Exception:
-                    pass
-                break
+        messagebox.showinfo(
+            "PL2D export campaign",
+            "PL2D campaign exported successfully.\n\n"
+            f"Run folder: {run_dir.name}\n"
+            f"Slices prepared: {len(zs)}\n\n"
+            "Files generated:\n"
+            "- manifest.json\n"
+            "- fort.9\n"
+            "- sliceXXX/pl2d.inp\n"
+            "- run_all.sh\n"
+            "- run_parallel.sh\n"
+            "- submit_slurm.sh\n"
+            "- cleanup_for_return.sh\n"
+            "- README_RUN.txt\n\n"
+            "This run is ready for Linux/macOS/cluster execution.\n"
+            "On Windows, transfer the campaign and execute the scripts in a Unix-like environment."
+        )
+    except Exception as e:
+        messagebox.showerror("PL2D", f"Failed to export campaign: {e}")
 
-            # Cleanup (optional, but keeps folders tidy). Ignore failures.
-            for fn in ("fort.3", "fort.9", "fort.11", "fort.13"):
-                try:
-                    p = sdir / fn
-                    if p.exists():
-                        p.unlink()
-                except Exception:
-                    pass
-
-            # (global progress intentionally not updated)
-
-            # Update per-page progress bar (per slice)
-            try:
-                self.pb["value"] = i + 1
-                self.lbl_pb.configure(text=f"Slice {i+1}/{len(zs)}")
-                self.update_idletasks()
-            except Exception:
-                pass
-
-        # (global progress intentionally not used for PL2D)
+def _cleanup_pl2d_slice_temp_files(self, slice_dir: Path) -> None:
+    """Best-effort cleanup after a locally executed PL2D slice."""
+    policy = str(getattr(self.app.state, "cleanup_policy", "minimal") or "minimal").strip().lower()
+    if policy == "none":
+        return
+    to_remove = ["fort.9"]
+    if policy == "standard":
+        to_remove.extend(["fort.3", "fort.11", "fort.13"])
+    for fn in to_remove:
         try:
-            # Finalize per-page progress bar
-            if ok_all:
-                self.pb["value"] = len(zs)
-                self.lbl_pb.configure(text=f"Done ({len(zs)}/{len(zs)})")
-            self.update_idletasks()
+            p = Path(slice_dir) / fn
+            if p.exists() or p.is_symlink():
+                p.unlink()
         except Exception:
             pass
 
-        mf["status"] = "complete" if ok_all else "failed"
-        (run_dir / "manifest.json").write_text(json.dumps(mf, indent=2), encoding="utf-8")
 
-        if not ok_all:
-            log_event(ctx, f"PL2D finished FAIL: {run_dir.name}")
-            messagebox.showerror("PL2D", "PL2D failed. Check slice folders and pl2d.out for details.")
-            self.lbl_status.configure(text="▶ PL2D not run")
-            return
+def _run_pl2d(self):
+    """Run PL2D in a background worker so the GUI stays responsive during slices."""
+    log_event(self.app.ctx, 'PL2D started')
 
-        self.app.state.pl2d_run_dir = run_dir
-        display_name = str(cfg.get("project_name") or "").strip() if bool(cfg.get("project_name_custom", False)) else run_dir.name
-        log_event(ctx, f"PL2D finished OK: {run_dir.name}")
-        self.lbl_status.configure(text="✔ PL2D existing")
-        self.app.set_status(f"PL2D finished: {display_name}")
+    if self.app._job_running:
+        messagebox.showinfo("PL2D", "A job is already running.")
+        return
+
+    if not (getattr(self.app.state, "workspace_compute_ok", False) and self.app.state.trho_parsed is not None):
         self.app.state.pl2d_running = False
-        self.app.refresh_all_pages()
+        messagebox.showwarning("PL2D", "PL2D requires a parsed TRHO result and fort.9 or *.f9/*.9 in the workspace.")
+        return
+
+    try:
+        cfg = self._build_config()
+    except Exception as e:
+        self.app.state.pl2d_running = False
+        messagebox.showerror("PL2D", f"Invalid configuration: {e}")
+        return
+
+    ctx = self.app.state
+    local_platform = get_platform_name()
+    if not self.app._ensure_properties_executable_ready("PL2D"):
+        self.app.state.pl2d_running = False
+        return
+    prop_exe = getattr(ctx, "properties_exe", None)
+    exe_path = _best_effort_make_executable(str(prop_exe) if prop_exe is not None else None)
+
+    fort9_src = None
+    if ctx.workspace_dir:
+        cand = ctx.workspace_dir / "fort.9"
+        if cand.exists():
+            fort9_src = cand
+    if fort9_src is None:
+        self.app.state.pl2d_running = False
+        messagebox.showerror("PL2D", "fort.9 not found in workspace. Make sure the workspace has fort.9 first.")
+        return
+
+    sig = self._signature(cfg)
+    root = self._runs_root()
+    root.mkdir(parents=True, exist_ok=True)
+
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    user_project_name = str(cfg.get("project_name") or "").strip() if bool(cfg.get("project_name_custom", False)) else ""
+    if user_project_name:
+        base_run_name = self._safe_project_slug(user_project_name) or "PL2D"
+        run_name = base_run_name
+        run_dir = root / run_name
+        counter = 2
+        while run_dir.exists():
+            run_name = f"{base_run_name}_{counter}"
+            run_dir = root / run_name
+            counter += 1
+    else:
+        run_name = f"{sig[:10]}_{cfg['n_slices']:03d}_{ts}"
+        run_dir = root / run_name
+    run_dir.mkdir(parents=True, exist_ok=False)
+
+    try:
+        f9_stat = fort9_src.stat()
+        f9_fp = {"size": int(f9_stat.st_size), "mtime": int(f9_stat.st_mtime)}
+    except Exception:
+        f9_fp = {}
+
+    mf = {
+        "signature": sig,
+        "created_at": ts,
+        "config": cfg,
+        "engine": "properties",
+        "properties_exe": str(exe_path),
+        "project_name": str(cfg.get("project_name", "") or "") if bool(cfg.get("project_name_custom", False)) else "",
+        "source": {"fort9": str(fort9_src), "fort9_fp": f9_fp},
+        "status": "running",
+    }
+    (run_dir / "manifest.json").write_text(json.dumps(mf, indent=2), encoding="utf-8")
+
+    ns = int(cfg["n_slices"])
+    zmin = float(cfg["zmin"])
+    zmax = float(cfg["zmax"])
+    if ns <= 0:
+        zs = [zmin]
+    else:
+        dz = (zmax - zmin) / ns
+        zs = [zmin + i * dz for i in range(ns + 1)]
+
+    iso_set = set(cfg["iso"])
+    flags = [
+        1 if "SURFRHOO" in iso_set else 0,
+        1 if "SURFSPDE" in iso_set else 0,
+        1 if "SURFLAPP" in iso_set else 0,
+        1 if "SURFLAPM" in iso_set else 0,
+        1 if "SURFGRHO" in iso_set else 0,
+        1 if "SURFKKIN" in iso_set else 0,
+        1 if "SURFGKIN" in iso_set else 0,
+        1 if "SURFVIRI" in iso_set else 0,
+        1 if "SURFELFB" in iso_set else 0,
+        0, 0, 0,
+    ]
+    flags_line = ",".join(str(x) for x in flags)
+
+    bohr_to_ang = float(getattr(ctx, "bohr_to_ang", 0.5291772083))
+    a_coord = (0.0, 0.0)
+    b_coord = (1.0, 0.0)
+    c_coord = (0.0, 1.0)
+
+    xmin = float(cfg["xmin"])
+    xmax = float(cfg["xmax"])
+    ymin = float(cfg["ymin"])
+    ymax = float(cfg["ymax"])
+    inc = float(cfg["inc"])
+
+    out_name = str(cfg.get("project_name") or (ctx.workspace_dir.name if ctx.workspace_dir else "PL2D"))
+
+    self.app._job_running = True
+    self.app.state.pl2d_running = True
+    self.app._active_job_kind = "PL2D"
+    self.lbl_status.configure(text='⏳ PL2D running…')
+    self.btn_run.configure(state='disabled')
+    if hasattr(self, "btn_export_campaign"):
+        self.btn_export_campaign.configure(state='disabled')
+    try:
+        self.pb.configure(maximum=len(zs), value=0)
+        self.lbl_pb.configure(text=f"Slice 0/{len(zs)}")
+    except Exception:
+        pass
+    try:
+        self.app.set_task(active=False)
+    except Exception:
+        pass
+    self.app.set_status("Running PL2D…")
+    self.app._job_queue.put(("log", f"[PL2D] Local execution platform: {local_platform}"))
+    self.app._job_queue.put(("log", f"[PL2D] Executable: {exe_path}"))
+
+    def worker():
+        ok_all = True
+        failure_msg = ""
+        try:
+            for i, z in enumerate(zs):
+                sdir = run_dir / f"slice{i:03d}"
+                sdir.mkdir()
+
+                try:
+                    shutil.copy2(fort9_src, sdir / "fort.9")
+                except Exception as e:
+                    ok_all = False
+                    failure_msg = f"Failed to copy fort.9 to {sdir}: {e}"
+                    self.app._job_queue.put(("log", f"[PL2D] {failure_msg}"))
+                    break
+
+                inp = sdir / "pl2d.inp"
+                try:
+                    with open(inp, "w", encoding="utf-8") as f:
+                        pl2d_text = (
+                            "TOPO\n"
+                            "PL2D\n"
+                            "0\n"
+                            f"{a_coord[0]/bohr_to_ang} {a_coord[1]/bohr_to_ang} {z/bohr_to_ang}\n"
+                            "0\n"
+                            f"{b_coord[0]/bohr_to_ang} {b_coord[1]/bohr_to_ang} {z/bohr_to_ang}\n"
+                            "0\n"
+                            f"{c_coord[0]/bohr_to_ang} {c_coord[1]/bohr_to_ang} {z/bohr_to_ang}\n"
+                            "3\n"
+                            "0\n"
+                            "30,15.0\n"
+                            "1\n"
+                            f"{xmin} {xmax} {inc}\n"
+                            f"{ymin} {ymax} {inc}\n"
+                            f"{flags_line}\n"
+                            f"{out_name}\n"
+                            "1\n"
+                            "2.,0.0,0\n"
+                            "2.2,1,1,1\n"
+                            "36,0\n"
+                            "END\n"
+                        )
+                        f.write(pl2d_text)
+                except Exception as e:
+                    ok_all = False
+                    failure_msg = f"Failed to write pl2d.inp in {sdir}: {e}"
+                    self.app._job_queue.put(("log", f"[PL2D] {failure_msg}"))
+                    break
+
+                out = sdir / "pl2d.out"
+                err = sdir / "pl2d.err"
+                try:
+                    with open(inp, "r", encoding="utf-8", errors="ignore") as fin,                          open(out, "w", encoding="utf-8") as fout,                          open(err, "w", encoding="utf-8") as ferr:
+                        proc = subprocess.Popen(
+                            [str(exe_path)],
+                            stdin=fin,
+                            stdout=fout,
+                            stderr=ferr,
+                            cwd=str(sdir),
+                            **_windows_subprocess_silent_kwargs(),
+                        )
+                        self.app._register_active_process(proc, "PL2D")
+                        rc = proc.wait()
+                        self.app._clear_active_process(proc)
+                    if rc != 0:
+                        ok_all = False
+                        failure_msg = f"properties returned {rc} on slice {i:03d}"
+                        self.app._job_queue.put(("log", f"[PL2D] {failure_msg}"))
+                        try:
+                            if err.exists():
+                                err_txt = err.read_text(errors="ignore")
+                                self.app._job_queue.put(("log", "[PL2D] STDERR:\n" + err_txt[-1000:]))
+                            if out.exists():
+                                out_txt = out.read_text(errors="ignore")
+                                self.app._job_queue.put(("log", "[PL2D] STDOUT tail:\n" + out_txt[-1000:]))
+                        except Exception:
+                            pass
+                        break
+                except Exception as e:
+                    self.app._clear_active_process()
+                    ok_all = False
+                    failure_msg = f"Failed to run properties on slice {i:03d}: {e}"
+                    self.app._job_queue.put(("log", f"[PL2D] {failure_msg}"))
+                    try:
+                        err.write_text("EXCEPTION\n" + str(e) + "\n\n" + traceback.format_exc(), encoding="utf-8")
+                    except Exception:
+                        pass
+                    break
+
+                self._cleanup_pl2d_slice_temp_files(sdir)
+                self.app._job_queue.put(("pl2d_progress", i + 1, len(zs), f"Slice {i+1}/{len(zs)}"))
+
+            mf["status"] = "complete" if ok_all else "failed"
+            mf["execution_mode"] = "local_windows" if is_windows() else "local_unix"
+            (run_dir / "manifest.json").write_text(json.dumps(mf, indent=2), encoding="utf-8")
+
+            if not ok_all:
+                log_event(ctx, f"PL2D finished FAIL: {run_dir.name}")
+                self.app._job_queue.put(("pl2d_fail", failure_msg or "PL2D failed. Check slice folders and pl2d.out for details.", str(run_dir)))
+                return
+
+            self.app._job_queue.put(("pl2d_progress", len(zs), len(zs), f"Done ({len(zs)}/{len(zs)})"))
+            self.app.state.pl2d_run_dir = run_dir
+            log_event(ctx, f"PL2D finished OK: {run_dir.name}")
+            self.app._job_queue.put(("pl2d_done", str(run_dir)))
+        except Exception as e:
+            self.app._clear_active_process()
+            try:
+                mf["status"] = "failed"
+                mf["execution_mode"] = "local_windows" if is_windows() else "local_unix"
+                (run_dir / "manifest.json").write_text(json.dumps(mf, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+            self.app._job_queue.put(("pl2d_fail", str(e), str(run_dir)))
+
+    self.app._job_thread = threading.Thread(target=worker, daemon=True)
+    self.app._job_thread.start()
 
 
+PL2DPage._write_pl2d_input_for_slice = _write_pl2d_input_for_slice
+PL2DPage._write_pl2d_unix_scripts = _write_pl2d_unix_scripts
+PL2DPage._export_pl2d_campaign = _export_pl2d_campaign
+PL2DPage._cleanup_pl2d_slice_temp_files = _cleanup_pl2d_slice_temp_files
+PL2DPage._run_pl2d = _run_pl2d
 
 class PL2DViewerPage(BasePage):
     """PL2D Project Viewer (v2-like logic, minimal refactor)
@@ -8956,31 +11517,30 @@ class PL2DViewerPage(BasePage):
 
         body = ttk.Frame(self)
         body.pack(fill="both", expand=True)
-        # Make the left control panel wider (especially for Geometric/Gatti mode)
-        # and keep the action column compact.
         body.columnconfigure(0, weight=1)
         body.columnconfigure(1, weight=0)
-        body.grid_columnconfigure(1, minsize=260)
+        body.rowconfigure(1, weight=1)
+        body.grid_columnconfigure(1, minsize=220)
 
-        # --- Run selection ---
+
         frm_run = ttk.LabelFrame(body, text="Existing PL2D runs (workspace/pl2d_runs)")
-        frm_run.grid(row=0, column=0, columnspan=2, sticky="nsew", pady=(0, 12))
+        frm_run.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
         frm_run.columnconfigure(1, weight=1)
 
-        ttk.Label(frm_run, text="Run:").grid(row=0, column=0, sticky="w", padx=10, pady=(10, 6))
+        ttk.Label(frm_run, text="Run:").grid(row=0, column=0, sticky="w", padx=10, pady=(8, 4))
         self.run_var = tk.StringVar(value="")
         self.cmb_runs = ttk.Combobox(frm_run, textvariable=self.run_var, state="readonly", width=55)
-        self.cmb_runs.grid(row=0, column=1, sticky="ew", padx=(0, 10), pady=(10, 6))
+        self.cmb_runs.grid(row=0, column=1, sticky="ew", padx=(0, 8), pady=(8, 4))
         self.cmb_runs.bind("<<ComboboxSelected>>", lambda e: self._on_run_selected())
 
-        ttk.Button(frm_run, text="Refresh list", command=self.refresh_runs).grid(row=0, column=2, sticky="e", padx=(0, 10), pady=(10, 6))
+        ttk.Button(frm_run, text="Refresh list", command=self.refresh_runs).grid(row=0, column=2, sticky="e", padx=(0, 10), pady=(8, 4))
 
         self.lbl_run_info = ttk.Label(frm_run, text="—", foreground="#444")
-        self.lbl_run_info.grid(row=1, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 10))
+        self.lbl_run_info.grid(row=1, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 8))
 
-        # --- Surface selection + plot controls ---
-        frm_ctl = ttk.Frame(body)
-        frm_ctl.grid(row=1, column=0, sticky="nsew", padx=(0, 10))
+
+        frm_ctl_outer, self._ctl_canvas, self._ctl_scrollbar, frm_ctl = _make_scrollable_frame(body)
+        frm_ctl_outer.grid(row=1, column=0, sticky="nsew", padx=(0, 10))
         frm_ctl.columnconfigure(0, weight=1)
 
         frm_surf = ttk.LabelFrame(frm_ctl, text="Topological isosurface (.DAT)")
@@ -8989,7 +11549,7 @@ class PL2DViewerPage(BasePage):
 
         self.surf_var = tk.StringVar(value="SURFRHOO")
 
-        ttk.Label(frm_surf, text="Surface:").grid(row=0, column=0, sticky="w", padx=(10, 8), pady=10)
+        ttk.Label(frm_surf, text="Surface:").grid(row=0, column=0, sticky="w", padx=(10, 8), pady=8)
         self.cmb_surface = ttk.Combobox(
             frm_surf,
             textvariable=self.surf_var,
@@ -8997,19 +11557,19 @@ class PL2DViewerPage(BasePage):
             width=42,
             values=(),
         )
-        self.cmb_surface.grid(row=0, column=1, sticky="ew", padx=(0, 10), pady=10)
+        self.cmb_surface.grid(row=0, column=1, sticky="ew", padx=(0, 8), pady=8)
         self.cmb_surface.bind("<<ComboboxSelected>>", lambda e: self._on_surf_selected())
 
-        # --- Plot params (minimal; v2-like) ---
-        frm_params = ttk.LabelFrame(frm_ctl, text="Plot parameters")
-        frm_params.grid(row=1, column=0, sticky="ew", pady=(10, 0))
 
-        self.var_opacity = tk.StringVar(value="0.2")  # default requested
+        frm_params = ttk.LabelFrame(frm_ctl, text="Plot parameters")
+        frm_params.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+
+        self.var_opacity = tk.StringVar(value="0.2")
         self.var_count = tk.StringVar(value="3")
         self.var_isomin = tk.StringVar(value="")
         self.var_isomax = tk.StringVar(value="")
 
-        # Gatti mode (geometric iso levels): base * factor^k (positive only)
+
         self.var_mode = tk.StringVar(value="linear")
         self.var_base_iso = tk.StringVar(value="")
         self.var_factor = tk.StringVar(value="4")
@@ -9018,12 +11578,12 @@ class PL2DViewerPage(BasePage):
         self.var_descending = tk.BooleanVar(value=False)
         self.var_geo_limit = tk.StringVar(value="")
 
-        # Shared controls (apply to both modes)
+
         row_shared = ttk.Frame(frm_params)
-        row_shared.pack(fill="x", padx=10, pady=(10, 6))
+        row_shared.pack(fill="x", padx=10, pady=(8, 4))
         _labeled_entry(row_shared, "Opacity (0-1)", self.var_opacity, width=8).pack(side="left", padx=(0, 18))
 
-        # Camera projection (requested): perspective vs orthographic
+
         self.var_projection = tk.StringVar(value="orthographic")
         ttk.Label(row_shared, text="Projection").pack(side="left", padx=(0, 6))
         self.cmb_projection = ttk.Combobox(
@@ -9035,18 +11595,18 @@ class PL2DViewerPage(BasePage):
         )
         self.cmb_projection.pack(side="left", padx=(0, 18))
 
-        # --- Iso level mode ---
+
         frm_mode = ttk.Frame(frm_params)
-        frm_mode.pack(fill="x", padx=10, pady=(0, 6))
+        frm_mode.pack(fill="x", padx=10, pady=(0, 4))
         ttk.Label(frm_mode, text="Mode:").pack(side="left")
         self.rb_linear = ttk.Radiobutton(frm_mode, text="Linear", variable=self.var_mode, value="linear", command=self._on_mode_change)
         self.rb_linear.pack(side="left", padx=(8, 0))
-        self.rb_geo = ttk.Radiobutton(frm_mode, text="Geometric (Gatti)", variable=self.var_mode, value="geometric", command=self._on_mode_change)
+        self.rb_geo = ttk.Radiobutton(frm_mode, text="Geometric", variable=self.var_mode, value="geometric", command=self._on_mode_change)
         self.rb_geo.pack(side="left", padx=(10, 0))
 
-        # Linear levels controls
+
         self.frm_linear_box = ttk.LabelFrame(frm_params, text="Linear levels")
-        self.frm_linear_box.pack(fill="x", padx=10, pady=(0, 8))
+        self.frm_linear_box.pack(fill="x", padx=10, pady=(0, 6))
         self.frm_linear = ttk.Frame(self.frm_linear_box)
         self.frm_linear.pack(fill="x", padx=10, pady=8)
         _labeled_entry(self.frm_linear, "#Isosurfaces", self.var_count, width=8).pack(side="left", padx=(0, 18))
@@ -9055,17 +11615,17 @@ class PL2DViewerPage(BasePage):
         self.ent_isomax = _labeled_entry(self.frm_linear, "Max iso", self.var_isomax, width=12)
         self.ent_isomax.pack(side="left", padx=(0, 0))
 
-        # Geometric (Gatti) controls
-        self.frm_geo_box = ttk.LabelFrame(frm_params, text="Geometric levels (Gatti)")
-        self.frm_geo_box.pack(fill="x", padx=10, pady=(0, 8))
+
+        self.frm_geo_box = ttk.LabelFrame(frm_params, text="Geometric levels")
+        self.frm_geo_box.pack(fill="x", padx=10, pady=(0, 6))
         self.frm_geo = ttk.Frame(self.frm_geo_box)
         self.frm_geo.pack(fill="x", padx=10, pady=8)
 
-        # Dynamic labels: Base/Limit correspond to Min/Max depending on Asc/Desc
+
         self.var_base_label = tk.StringVar(value="Base iso")
         self.var_limit_label = tk.StringVar(value="Limit")
 
-        # Row 1: Factor / Max levels / toggles
+
         geo_row1 = ttk.Frame(self.frm_geo)
         geo_row1.pack(fill="x", pady=(0, 6))
         self.ent_factor = _labeled_entry(geo_row1, "Factor", self.var_factor, width=8)
@@ -9078,7 +11638,7 @@ class PL2DViewerPage(BasePage):
         self.chk_usemax = ttk.Checkbutton(geo_row1, text="Use dataset max", variable=self.var_use_data_max, command=self._on_mode_change)
         self.chk_usemax.pack(side="left")
 
-        # Row 2: Base iso / Limit
+
         geo_row2 = ttk.Frame(self.frm_geo)
         geo_row2.pack(fill="x", pady=(0, 0))
         self.ent_base = _labeled_entry(geo_row2, self.var_base_label, self.var_base_iso, width=12)
@@ -9086,20 +11646,19 @@ class PL2DViewerPage(BasePage):
         self.ent_geolim = _labeled_entry(geo_row2, self.var_limit_label, self.var_geo_limit, width=12)
         self.ent_geolim.pack(side="left")
 
-        # Defer mode refresh until widgets are created
+
         self.after(0, self._on_mode_change)
 
         self.hint = ttk.Label(frm_params, text="Tip: If Min/Max are empty, they are auto-set from data.", foreground="#555")
-        self.hint.pack(anchor="w", padx=10, pady=(0, 10))
+        self.hint.pack(anchor="w", padx=10, pady=(0, 6))
 
-        # --- Overlays (TRUE atoms + BCPs) ---
-        # Lightweight overlays using Scatter3d (no Mesh3d spheres).
+
         frm_ov = ttk.LabelFrame(frm_params, text="Overlays (3D)")
-        frm_ov.pack(fill="x", padx=10, pady=(0, 10))
+        frm_ov.pack(fill="x", padx=10, pady=(0, 6))
         frm_ov.columnconfigure(0, weight=0)
         frm_ov.columnconfigure(1, weight=1)
 
-        # TRUE atoms controls (left)
+
         frm_atoms = ttk.LabelFrame(frm_ov, text="TRUE atoms")
         frm_atoms.grid(row=0, column=0, sticky="nw", padx=(0, 8), pady=(6, 6))
 
@@ -9118,7 +11677,7 @@ class PL2DViewerPage(BasePage):
         ttk.Checkbutton(row_b, text="Labels", variable=self.var_atom_labels).pack(side="left", padx=(0, 14))
         ttk.Checkbutton(row_b, text="Group by element", variable=self.var_atom_group).pack(side="left")
 
-        # BCP controls (right) — rendered with a different marker (diamond-open) to distinguish from atoms.
+
         frm_bcps = ttk.LabelFrame(frm_ov, text="BCPs")
         frm_bcps.grid(row=0, column=1, sticky="nsew", padx=(8, 0), pady=(6, 6))
 
@@ -9140,8 +11699,6 @@ class PL2DViewerPage(BasePage):
         ttk.Checkbutton(row_d, text="Bond path", variable=self.var_show_bond_paths).pack(side="left")
 
 
-        # RCP/CCP controls — optional markers for ring/cage CPs (from TRHO output).
-        # Placed in the Viewer (not in the PL2D runner) because it only affects visualization overlays.
         frm_rcpccp = ttk.LabelFrame(frm_ov, text="RCP / CCP")
         frm_rcpccp.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=0, pady=(0, 6))
 
@@ -9162,7 +11719,7 @@ class PL2DViewerPage(BasePage):
         _labeled_entry(row_e, "Size", self.var_ccp_size, width=6).pack(side="left", padx=(0, 14))
         ttk.Checkbutton(row_e, text="Labels", variable=self.var_ccp_labels).pack(side="left")
 
-        # NNA controls — optional markers for flagged (3,-3) attractors.
+
         frm_nna = ttk.LabelFrame(frm_ov, text="NNA")
         frm_nna.grid(row=2, column=0, columnspan=2, sticky="nsew", padx=0, pady=(0, 6))
 
@@ -9176,10 +11733,25 @@ class PL2DViewerPage(BasePage):
         _labeled_entry(row_f, "Size", self.var_nna_size, width=6).pack(side="left", padx=(0, 14))
         ttk.Checkbutton(row_f, text="Labels", variable=self.var_nna_labels).pack(side="left")
 
-# --- Actions ---
+
         frm_act = ttk.Frame(body)
         frm_act.grid(row=1, column=1, sticky="ne")
         frm_act.columnconfigure(0, weight=1)
+
+        export_note = (
+            "HTML export uses the current Plotly settings and saves exactly "
+            "the displayed view.\n\n"
+            "CUBE export saves the complete scalar grid; isosurface levels "
+            "must be adjusted in the external viewer."
+        )
+        self.lbl_export_note = ttk.Label(
+            frm_act,
+            text=export_note,
+            foreground=UI_FG_MAIN,
+            wraplength=245,
+            justify="left",
+        )
+        self.lbl_export_note.pack(anchor="nw", fill="x", pady=(0, 18))
 
         self.btn_plot = ttk.Button(frm_act, text="Visualize (Plotly)", command=self._plot, width=18)
         try:
@@ -9188,32 +11760,45 @@ class PL2DViewerPage(BasePage):
             pass
         self.btn_plot.pack(anchor="nw")
 
-        # --- Optional: save Plotly project to HTML (v2-like) ---
-        # Run/project name is already selected above (Run combobox), so we do not repeat it here.
-        # The HTML will be saved inside the selected run folder.
-        self.var_save_html = tk.BooleanVar(value=False)
+        self.btn_export_html = ttk.Button(frm_act, text="Export HTML", command=self._export_html, width=18)
+        try:
+            self.btn_export_html.configure(padding=(10, 6))
+        except Exception:
+            pass
+        self.btn_export_html.pack(anchor="nw", pady=(8, 0))
 
-        self.chk_save_html = ttk.Checkbutton(
-            frm_act,
-            text="Save Plotly project (HTML) in run folder",
-            variable=self.var_save_html,
-        )
-        self.chk_save_html.pack(anchor="nw", pady=(10, 0))
+        self.btn_export_cube = ttk.Button(frm_act, text="Export CUBE", command=self._export_cube, width=18)
+        try:
+            self.btn_export_cube.configure(padding=(10, 6))
+        except Exception:
+            pass
+        self.btn_export_cube.pack(anchor="nw", pady=(8, 0))
 
-        self.lbl_status = ttk.Label(frm_act, text="—", foreground="#444", wraplength=360)
+        self.lbl_status = ttk.Label(frm_act, text="—", foreground="#444", wraplength=245)
         self.lbl_status.pack(anchor="nw", pady=(10, 0))
+
+        self._set_action_buttons_state(False)
+
+    def _set_action_buttons_state(self, enabled: bool) -> None:
+        """Enable PL2D Viewer action/export buttons only when a valid run and surface are selected."""
+        state = "normal" if bool(enabled) else "disabled"
+        for attr in ("btn_plot", "btn_export_html", "btn_export_cube"):
+            try:
+                getattr(self, attr).configure(state=state)
+            except Exception:
+                pass
 
     def _on_mode_change(self):
         """Enable/disable parameter fields according to iso-level mode."""
         mode = self.var_mode.get().strip() or "linear"
         if mode == "geometric":
-            # Show/Hide mode-specific panels
+
             try:
                 self.frm_linear_box.pack_forget()
             except Exception:
                 pass
             try:
-                self.frm_geo_box.pack(fill="x", padx=10, pady=(0, 8))
+                self.frm_geo_box.pack(fill="x", padx=10, pady=(0, 6))
             except Exception:
                 pass
 
@@ -9222,15 +11807,13 @@ class PL2DViewerPage(BasePage):
                     w.configure(state="normal")
                 except Exception:
                     pass
-            # If using dataset max, disable limit entry
+
             try:
                 self.ent_geolim.configure(state=("disabled" if self.var_use_data_max.get() else "normal"))
             except Exception:
                 pass
-            
-            # Convenience: when switching to Gatti mode, auto-seed base/limit from current Linear Min/Max
-            # - Ascending: base=Min, limit=Max
-            # - Descending: base=Max, limit=Min
+
+
             try:
                 descending = bool(self.var_descending.get())
                 lin_min = self.var_isomin.get().strip()
@@ -9246,7 +11829,7 @@ class PL2DViewerPage(BasePage):
                     elif (not descending) and lin_max:
                         self.var_geo_limit.set(lin_max)
 
-                # If we have an explicit limit, prefer it over dataset-based defaults.
+
                 if self.var_geo_limit.get().strip():
                     self.var_use_data_max.set(False)
                     try:
@@ -9256,7 +11839,7 @@ class PL2DViewerPage(BasePage):
             except Exception:
                 pass
 
-            # Update dynamic labels (Base/Limit act like extrema)
+
             try:
                 descending = bool(self.var_descending.get())
                 if descending:
@@ -9268,17 +11851,17 @@ class PL2DViewerPage(BasePage):
             except Exception:
                 pass
         else:
-            # Show/Hide mode-specific panels
+
             try:
                 self.frm_geo_box.pack_forget()
             except Exception:
                 pass
             try:
-                self.frm_linear_box.pack(fill="x", padx=10, pady=(0, 8))
+                self.frm_linear_box.pack(fill="x", padx=10, pady=(0, 6))
             except Exception:
                 pass
 
-            # Re-enable linear inputs
+
             for w in [self.ent_isomin, self.ent_isomax]:
                 try:
                     w.configure(state="normal")
@@ -9298,7 +11881,7 @@ class PL2DViewerPage(BasePage):
             for rd in sorted(root.iterdir()):
                 if not rd.is_dir():
                     continue
-                # Prefer complete runs with manifest, but allow any folder with slice000
+
                 mf = rd / "manifest.json"
                 ok = False
                 if mf.exists():
@@ -9311,13 +11894,13 @@ class PL2DViewerPage(BasePage):
                     runs.append(rd.name)
 
         if ws:
-            # Most common layout: <workspace>/pl2d_runs/<run>/slice000
+
             if (ws / "pl2d_runs").exists():
                 _collect(ws / "pl2d_runs")
-            # If user selected pl2d_runs itself as workspace
+
             elif ws.name == "pl2d_runs":
                 _collect(ws)
-            # If user selected a single run folder directly
+
             elif (ws / "slice000").exists():
                 runs = [ws.name]
 
@@ -9333,6 +11916,7 @@ class PL2DViewerPage(BasePage):
             self.surf_var.set("")
             if hasattr(self, "lbl_status"):
                 self.lbl_status.config(text="—")
+            self.refresh_state()
 
     def _current_run_dir(self) -> Optional[Path]:
         ws = self.app.ctx.workspace_dir
@@ -9341,31 +11925,29 @@ class PL2DViewerPage(BasePage):
         name = self.run_var.get().strip()
         if not name:
             return None
-        # Three possible interpretations based on what the user picked as workspace:
-        # 1) <workspace>/pl2d_runs/<run>
-        # 2) <pl2d_runs>/<run>
-        # 3) <run> (workspace is the run itself)
+
+
         if (ws / "slice000").exists():
             return ws
         if (ws / "pl2d_runs").exists():
             return ws / "pl2d_runs" / name
         if ws.name == "pl2d_runs":
             return ws / name
-        # fallback
+
         return ws / "pl2d_runs" / name
 
     def _detect_slices(self, run_dir: Path) -> list[Path]:
-        # slices are folders slice000..sliceXYZ
+
         slices = sorted([p for p in run_dir.glob("slice*") if p.is_dir() and p.name[5:].isdigit()])
         return slices
 
     def _available_surfaces(self, run_dir: Path) -> list[str]:
-        # Check slice000 for *.DAT
+
         s0 = run_dir / "slice000"
         if not s0.exists():
             return []
         dats = sorted([p.name for p in s0.glob("*.DAT")])
-        # keep only SURF*.DAT to match v2 GUI
+
         surfs = [d.replace(".DAT", "") for d in dats if d.upper().startswith("SURF")]
         return surfs
 
@@ -9373,22 +11955,25 @@ class PL2DViewerPage(BasePage):
         rd = self._current_run_dir()
         if rd is None or not rd.exists():
             self.lbl_run_info.config(text="Invalid run selection.")
+            self.cmb_surface["values"] = ()
+            self.surf_var.set("")
+            self.refresh_state()
             return
 
         slices = self._detect_slices(rd)
-        n_slices = max(0, len(slices) - 1)  # v2 meaning (intervals); folders are planes
+        n_slices = max(0, len(slices) - 1)
         self.lbl_run_info.config(text=f"Folder: {rd.name} | planes: {len(slices)} | n_slices={n_slices}")
 
 
         surfs = self._available_surfaces(rd)
         self.cmb_surface["values"] = surfs
 
-        # Set a default surface (prefer SURFRHOO)
+
         if surfs:
             pick = "SURFRHOO" if "SURFRHOO" in surfs else surfs[0]
             if self.surf_var.get().strip() not in surfs:
                 self.surf_var.set(pick)
-            # auto-set min/max from this surface
+
             self._auto_set_isorange()
         else:
             self.surf_var.set("")
@@ -9414,13 +11999,13 @@ class PL2DViewerPage(BasePage):
             if not surf:
                 return
             vmin, vmax = self._load_volume(rd, surf, compute_only_minmax=True)
-            # If fields are empty, fill them. (Keeps manual edits.)
+
             if not self.var_isomin.get().strip():
                 self.var_isomin.set(f"{vmin:.6g}")
             if not self.var_isomax.get().strip():
                 self.var_isomax.set(f"{vmax:.6g}")
 
-            # Also seed Gatti fields if user is in geometric mode and fields are empty.
+
             mode = (self.var_mode.get().strip() or "linear").lower()
             if mode == "geometric":
                 descending = bool(self.var_descending.get())
@@ -9443,7 +12028,7 @@ class PL2DViewerPage(BasePage):
         if not slices:
             raise RuntimeError("No slice folders found.")
 
-        # Read nptx/npty from the FIRST valid slice (some runs may have incomplete slice000)
+
         f0 = None
         lines0 = None
         for sdir in slices:
@@ -9468,7 +12053,7 @@ class PL2DViewerPage(BasePage):
             raise RuntimeError(f"Could not read nptx/npty from: {f0}")
         nptx, npty = int(float(nconj[0])), int(float(nconj[1]))
 
-# Read planes
+
         planes = []
         vmin = None
         vmax = None
@@ -9482,17 +12067,15 @@ class PL2DViewerPage(BasePage):
                 lns = fp.readlines()
 
             if len(lns) <= header_lines:
-                # Incomplete run (or a partially written slice). Skip this slice instead of aborting.
+
                 continue
 
             data_txt = " ".join([x.strip() for x in lns[header_lines:]])
             arr = np.asarray(pd.to_numeric(data_txt.split()), dtype=float)
             if arr.size != nptx * npty:
                 raise RuntimeError(f"Grid size mismatch in {fdat.name} ({sdir.name}): got {arr.size}, expected {nptx*npty}")
-            # Orientation note:
-            # PROPERTIES PL2D grids are written with the *second* index (Y) varying slowest in many cases.
-            # To keep the visual axes consistent with the PL2D input points (P2 along +x, P3 along +y),
-            # we reshape as (npty, nptx) and transpose back to (nptx, npty).
+
+
             grid = arr.reshape(npty, nptx).T
 
             if compute_only_minmax:
@@ -9511,10 +12094,182 @@ class PL2DViewerPage(BasePage):
         if not planes:
             raise RuntimeError("No valid slices found (all DAT files were missing/too short).")
 
-        volume = np.stack(planes, axis=0)  # (n_planes, nptx, npty)
+        volume = np.stack(planes, axis=0)
         return volume
 
-    def _plot(self):
+    def _pl2d_grid_coordinates(self, run_dir: Path, n_planes: int, nptx: int, npty: int):
+        """Return x/y/z coordinates in Angstrom for a PL2D volume grid.
+
+        This mirrors the coordinate reconstruction used by _plot(), so HTML and
+        CUBE exports refer to the same physical grid. X/Y are read from
+        slice000/pl2d.inp; Z is read from each slice/pl2d.inp and converted from
+        bohr to Angstrom, following the current PL2D Viewer convention.
+        """
+        x_coords = np.arange(int(nptx), dtype=float)
+        y_coords = np.arange(int(npty), dtype=float)
+        z_coords = np.arange(int(n_planes), dtype=float)
+
+        try:
+            inp0 = Path(run_dir) / "slice000" / "pl2d.inp"
+            if inp0.exists():
+                triples = []
+                for ln in inp0.read_text(errors="ignore").splitlines():
+                    ln = ln.strip()
+                    if (not ln) or ("," in ln):
+                        continue
+                    parts = ln.split()
+                    if len(parts) == 3:
+                        try:
+                            triples.append([float(q) for q in parts])
+                        except Exception:
+                            pass
+                if len(triples) >= 2:
+                    xmin, xmax, _xinc = triples[-2]
+                    ymin, ymax, _yinc = triples[-1]
+                    x_coords = np.linspace(float(xmin), float(xmax), int(nptx))
+                    y_coords = np.linspace(float(ymin), float(ymax), int(npty))
+
+            slice_dirs = self._detect_slices(Path(run_dir))
+            z_list = []
+            for sd in slice_dirs:
+                f = sd / "pl2d.inp"
+                if not f.exists():
+                    z_list = []
+                    break
+                triples = []
+                for ln in f.read_text(errors="ignore").splitlines():
+                    ln = ln.strip()
+                    if (not ln) or ("," in ln):
+                        continue
+                    parts = ln.split()
+                    if len(parts) == 3:
+                        try:
+                            triples.append([float(q) for q in parts])
+                        except Exception:
+                            pass
+                if len(triples) >= 3:
+                    zvals = (triples[0][2], triples[1][2], triples[2][2])
+                    z_list.append(float(sum(zvals) / 3.0))
+
+            if z_list:
+                if len(z_list) == int(n_planes):
+                    z_coords = np.asarray(z_list, dtype=float)
+                else:
+                    z_coords = np.linspace(float(z_list[0]), float(z_list[-1]), int(n_planes))
+                z_coords = z_coords * 0.529177210903
+        except Exception:
+            pass
+
+        return x_coords, y_coords, z_coords
+
+    def _selected_cube_atoms(self):
+        """Return atom rows for CUBE export, using TRUE atoms when available."""
+        try:
+            parsed = getattr(self.app.ctx, "trho_parsed", None)
+            df = getattr(parsed, "df_true_atoms", None) if parsed is not None else None
+            if df is not None and not df.empty:
+                return df.copy()
+        except Exception:
+            pass
+        return pd.DataFrame()
+
+    def _write_cube_file(self, cube_path: Path, vol: np.ndarray, x_coords, y_coords, z_coords, *, surf: str, run_dir: Path):
+        """Write a Gaussian CUBE file for the selected PL2D scalar volume.
+
+        The CUBE export contains only the scalar grid. It intentionally does not
+        export atoms, BCPs, bond paths or any other TopIso3D overlay because those
+        objects may not share the same reference frame as the PL2D grid and could
+        be misinterpreted by external viewers. Isosurface levels must be chosen
+        in the external viewer (for example VESTA). The HTML export remains the
+        faithful export of the current TopIso3D visualization settings.
+        """
+        bohr_to_ang = 0.529177210903
+        ang_to_bohr = 1.0 / bohr_to_ang
+
+        n_planes, nptx, npty = [int(v) for v in vol.shape]
+        if nptx < 2 or npty < 2 or n_planes < 2:
+            raise RuntimeError("CUBE export requires at least two grid points along x, y and z.")
+
+        x_coords = np.asarray(x_coords, dtype=float)
+        y_coords = np.asarray(y_coords, dtype=float)
+        z_coords = np.asarray(z_coords, dtype=float)
+
+        origin_ang = np.array([float(x_coords[0]), float(y_coords[0]), float(z_coords[0])], dtype=float)
+        vx_ang = np.array([(float(x_coords[-1]) - float(x_coords[0])) / float(nptx - 1), 0.0, 0.0], dtype=float)
+        vy_ang = np.array([0.0, (float(y_coords[-1]) - float(y_coords[0])) / float(npty - 1), 0.0], dtype=float)
+        vz_ang = np.array([0.0, 0.0, (float(z_coords[-1]) - float(z_coords[0])) / float(n_planes - 1)], dtype=float)
+
+        cube_path = Path(cube_path)
+        cube_path.parent.mkdir(parents=True, exist_ok=True)
+        with cube_path.open("w", encoding="utf-8") as f:
+            f.write(f"TopIso3D PL2D scalar-grid CUBE export: {surf}\n")
+            f.write(f"Run: {Path(run_dir).name} | No atoms exported | Source grid: PL2D SURF*.DAT\n")
+            org = origin_ang * ang_to_bohr
+            f.write(f"{0:5d} {org[0]:13.6f} {org[1]:13.6f} {org[2]:13.6f}\n")
+            vx = vx_ang * ang_to_bohr
+            vy = vy_ang * ang_to_bohr
+            vz = vz_ang * ang_to_bohr
+            f.write(f"{nptx:5d} {vx[0]:13.6f} {vx[1]:13.6f} {vx[2]:13.6f}\n")
+            f.write(f"{npty:5d} {vy[0]:13.6f} {vy[1]:13.6f} {vy[2]:13.6f}\n")
+            f.write(f"{n_planes:5d} {vz[0]:13.6f} {vz[1]:13.6f} {vz[2]:13.6f}\n")
+
+            vals_on_line = 0
+            for ix in range(nptx):
+                for iy in range(npty):
+                    for iz in range(n_planes):
+                        f.write(f" {float(vol[iz, ix, iy]):13.5E}")
+                        vals_on_line += 1
+                        if vals_on_line >= 6:
+                            f.write("\n")
+                            vals_on_line = 0
+            if vals_on_line:
+                f.write("\n")
+
+    def _export_cube(self):
+        rd = self._current_run_dir()
+        if rd is None or not rd.exists():
+            messagebox.showwarning("PL2D Viewer", "Select a valid run folder.")
+            return
+        surf = self.surf_var.get().strip()
+        if not surf:
+            messagebox.showwarning("PL2D Viewer", "Select an isosurface type.")
+            return
+        try:
+            vol = self._load_volume(rd, surf, compute_only_minmax=False)
+            n_planes, nptx, npty = vol.shape
+            x_coords, y_coords, z_coords = self._pl2d_grid_coordinates(rd, n_planes, nptx, npty)
+
+            def _sanitize(name: str) -> str:
+                return re.sub(r"[^A-Za-z0-9_-]+", "_", str(name or "")).strip("_") or "pl2d"
+
+            default_name = f"{_sanitize(Path(rd).name)}_{_sanitize(surf)}.cub"
+            target = filedialog.asksaveasfilename(
+                parent=self,
+                title="Export PL2D scalar map as CUBE",
+                initialdir=str(Path(rd)),
+                initialfile=default_name,
+                defaultextension=".cub",
+                filetypes=[("Gaussian Cube", "*.cub"), ("Cube", "*.cube"), ("All files", "*.*")],
+            )
+            if not target:
+                return
+            self._write_cube_file(Path(target), vol, x_coords, y_coords, z_coords, surf=surf, run_dir=rd)
+            self.lbl_status.config(text=f"Saved CUBE scalar grid: {Path(target).name}")
+            messagebox.showinfo(
+                "PL2D Viewer",
+                "CUBE scalar grid saved successfully.\n\n"
+                "No atoms or TopIso3D overlays were exported. Choose the isosurface value directly in the external viewer.\n\n"
+                f"{target}",
+                parent=self,
+            )
+        except Exception as e:
+            self.lbl_status.config(text=f"CUBE export failed: {e}")
+            messagebox.showerror("PL2D Viewer", f"CUBE export failed:\n\n{e}", parent=self)
+
+    def _export_html(self):
+        self._plot(export_html=True)
+
+    def _plot(self, export_html: bool = False):
         rd = self._current_run_dir()
         if rd is None or not rd.exists():
             messagebox.showwarning("PL2D Viewer", "Select a valid run folder.")
@@ -9524,7 +12279,7 @@ class PL2DViewerPage(BasePage):
             messagebox.showwarning("PL2D Viewer", "Select an isosurface type.")
             return
 
-        # Colorscale overrides for Laplacian isosurfaces (SURFLAPM/SURFLAPP)
+
         lap_cs = None
         try:
             scheme = (getattr(self.app.state, "laplacian_scheme", None) or self.app._settings.get("laplacian_scheme") or "blue_red").strip() or "blue_red"
@@ -9533,7 +12288,7 @@ class PL2DViewerPage(BasePage):
                     lap_cs = "Viridis"
                 elif scheme == "red_blue":
                     lap_cs = "Reds" if surf == "SURFLAPM" else "Blues"
-                else:  # blue_red (default)
+                else:
                     lap_cs = "Blues" if surf == "SURFLAPM" else "Reds"
         except Exception:
             lap_cs = None
@@ -9549,11 +12304,11 @@ class PL2DViewerPage(BasePage):
             messagebox.showerror("PL2D Viewer", f"Invalid plot parameters: {e}")
             return
 
-        # Load full volume
+
         try:
             vol = self._load_volume(rd, surf, compute_only_minmax=False)
             n_planes, nptx, npty = vol.shape
-            # Auto-set min/max if empty
+
             if not self.var_isomin.get().strip():
                 self.var_isomin.set(f"{float(vol.min()):.6g}")
             if not self.var_isomax.get().strip():
@@ -9562,7 +12317,7 @@ class PL2DViewerPage(BasePage):
             mode = (self.var_mode.get().strip() or "linear").lower()
 
             if mode == "geometric":
-                # Geometric iso levels: base * factor^k (positive only), up to a limit
+
                 base = self._parse_float(self.var_base_iso.get())
                 if base <= 0:
                     raise ValueError("Base iso must be > 0.")
@@ -9579,13 +12334,11 @@ class PL2DViewerPage(BasePage):
                 data_max = float(vol.max())
                 data_min = float(vol.min())
 
-                # Sanity checks vs dataset range (helps avoid confusing plots)
+
                 if not (data_min <= base <= data_max):
                     raise ValueError(f"Base iso ({base}) is outside dataset range [{data_min:.6g}, {data_max:.6g}].")
 
-                # Limit resolution:
-                # - If the user provided an explicit Limit, ALWAYS use it (even if "Use dataset max" is checked).
-                # - Otherwise, use dataset max only when enabled.
+
                 limit_txt = (self.var_geo_limit.get() or "").strip()
                 if limit_txt:
                     limit = self._parse_float(limit_txt)
@@ -9604,7 +12357,7 @@ class PL2DViewerPage(BasePage):
                     if base > limit:
                         raise ValueError(f"Base iso ({base}) is greater than limit ({limit}).")
 
-                # Build levels
+
                 levels = []
                 v = base
                 for _ in range(max_levels):
@@ -9630,83 +12383,17 @@ class PL2DViewerPage(BasePage):
             messagebox.showerror("PL2D Viewer", f"Failed to plot: {e}")
             return
 
-        # Build scaled grid coordinates (Å) using PL2D inputs when available.
-        # Default (fallback): index coordinates.
-        x_coords = np.arange(nptx, dtype=float)
-        y_coords = np.arange(npty, dtype=float)
-        z_coords = np.arange(n_planes, dtype=float)
 
-        try:
-            # 1) X/Y ranges from slice000/pl2d.inp (last two numeric triplets are x_range_inc and y_range_inc)
-            inp0 = rd / "slice000" / "pl2d.inp"
-            if inp0.exists():
-                triples = []
-                for ln in inp0.read_text(errors="ignore").splitlines():
-                    ln = ln.strip()
-                    if (not ln) or ("," in ln):
-                        continue
-                    parts = ln.split()
-                    if len(parts) == 3:
-                        try:
-                            triples.append([float(p) for p in parts])
-                        except Exception:
-                            pass
-                if len(triples) >= 2:
-                    (xmin, xmax, _xinc) = triples[-2]
-                    (ymin, ymax, _yinc) = triples[-1]
-                    # Use linspace to match exactly nptx/npty grid points
-                    x_coords = np.linspace(xmin, xmax, int(nptx))
-                    y_coords = np.linspace(ymin, ymax, int(npty))
+        x_coords, y_coords, z_coords = self._pl2d_grid_coordinates(rd, n_planes, nptx, npty)
 
-            # 2) Z planes from each slice/pl2d.inp (average z of the first 3 coordinate triplets)
-            slice_dirs = sorted([p for p in rd.iterdir() if p.is_dir() and p.name.startswith("slice")])
-            z_list = []
-            for sd in slice_dirs:
-                f = sd / "pl2d.inp"
-                if not f.exists():
-                    z_list = []
-                    break
-                triples = []
-                for ln in f.read_text(errors="ignore").splitlines():
-                    ln = ln.strip()
-                    if (not ln) or ("," in ln):
-                        continue
-                    parts = ln.split()
-                    if len(parts) == 3:
-                        try:
-                            triples.append([float(p) for p in parts])
-                        except Exception:
-                            pass
-                if len(triples) >= 3:
-                    zvals = (triples[0][2], triples[1][2], triples[2][2])
-                    z_list.append(float(sum(zvals) / 3.0))
 
-            if z_list:
-                if len(z_list) == int(n_planes):
-                    z_coords = np.asarray(z_list, dtype=float)
-                else:
-                    # Fallback: map first->last to n_planes
-                    z_coords = np.linspace(float(z_list[0]), float(z_list[-1]), int(n_planes))
-
-            # Unit handling: in our workflow X and Y are in Å, but Z from PL2D plane points is in Bohr.
-            # Convert Z coordinates to Å to avoid the ~1.8897x apparent stretching and doubled z-axis range.
-            try:
-                bohr_to_ang = 0.529177210903
-                z_coords = z_coords * bohr_to_ang
-            except Exception:
-                pass
-        except Exception:
-            # Keep index coordinates on any parsing error
-            pass
-
-        # Build coordinate arrays matching vol shape (n_planes, nptx, npty)
         Zc = z_coords[:, None, None] * np.ones((int(n_planes), int(nptx), int(npty)))
         Xc = x_coords[None, :, None] * np.ones((int(n_planes), int(nptx), int(npty)))
         Yc = y_coords[None, None, :] * np.ones((int(n_planes), int(nptx), int(npty)))
 
         fig = go.Figure()
 
-        # Axis labels in Å (scaled from PL2D inputs when available)
+
         try:
             proj = (self.var_projection.get() if hasattr(self, "var_projection") else "orthographic")
             proj = (proj or "orthographic").strip().lower()
@@ -9735,9 +12422,8 @@ class PL2DViewerPage(BasePage):
         )
 
         if (self.var_mode.get().strip() or "linear").lower() == "geometric":
-            # In practice, multiple fixed-level isosurfaces look *much* fainter than a single
-            # continuous isosurface. If user keeps the default opacity=0.2, the result becomes
-            # barely visible. We apply a gentle visibility boost only in the geometric mode.
+
+
             try:
                 op_user = float(opacity)
             except Exception:
@@ -9746,12 +12432,12 @@ class PL2DViewerPage(BasePage):
             if len(levels) >= 2 and op_eff < 0.35:
                 op_eff = min(0.85, op_eff * 3.0)
 
-            # Discrete colors for Gatti levels (ordered palette)
+
             try:
                 samples = np.linspace(0.10, 0.90, max(1, len(levels)))
                 lvl_colors = pc.sample_colorscale((lap_cs or "Viridis"), samples)
             except Exception:
-                # Fallback palette (Viridis-like)
+
                 lvl_colors = [
                     "rgba(68,1,84,1)",
                     "rgba(71,44,122,1)",
@@ -9764,9 +12450,9 @@ class PL2DViewerPage(BasePage):
                     "rgba(253,231,37,1)",
                 ]
                 if len(lvl_colors) < len(levels):
-                    # repeat if needed
+
                     lvl_colors = (lvl_colors * (len(levels)//len(lvl_colors) + 1))[:len(levels)]
-            # One Isosurface trace per level (Plotly does not accept arbitrary level lists in a single trace)
+
             for i, lvl in enumerate(levels):
                 fig.add_trace(
                     go.Isosurface(
@@ -9780,7 +12466,7 @@ class PL2DViewerPage(BasePage):
                         name=f"iso={float(lvl):.6g} a.u.",
                         showlegend=True,
                         legendgroup="gatti_levels",
-                        # Hide caps to avoid the "transparent box" look.
+
                         caps=dict(x_show=False, y_show=False, z_show=False),
                         surface_count=1,
                         colorscale=[[0, lvl_colors[i % len(lvl_colors)]], [1, lvl_colors[i % len(lvl_colors)]]],
@@ -9788,13 +12474,13 @@ class PL2DViewerPage(BasePage):
                         showscale=False,
                     )
                 )
-            # Show selected levels explicitly (shortened if too long)
+
             lev_strs = [f"{v:.6g}" for v in levels]
             if len(lev_strs) > 8:
                 lev_disp = ", ".join(lev_strs[:4] + ["…"] + lev_strs[-3:])
             else:
                 lev_disp = ", ".join(lev_strs)
-            title_txt = f"{rd.name} | {n_planes-1} slices | {len(levels)} levels | {surf} | Mode=Geometric (Gatti) | base={levels[0]:.6g} a.u. | factor={self.var_factor.get().strip() or '4'} | limit={limit:.6g} a.u. | levels (a.u.): {lev_disp}"
+            title_txt = f"{rd.name} | {n_planes-1} slices | {len(levels)} levels | {surf} | Mode=Geometric | base={levels[0]:.6g} a.u. | factor={self.var_factor.get().strip() or '4'} | limit={limit:.6g} a.u. | levels (a.u.): {lev_disp}"
         else:
             fig.add_trace(
                 go.Isosurface(
@@ -9814,7 +12500,7 @@ class PL2DViewerPage(BasePage):
             )
             title_txt = f"{rd.name} | {n_planes-1} slices | {count} isosurfaces | {surf} | Mode=Linear | Min={isomin} a.u. | Max={isomax} a.u."
 
-        # --- Optional overlay: TRUE atoms (Scatter3d, lightweight) ---
+
         try:
             if getattr(self, "var_show_atoms", None) is not None and bool(self.var_show_atoms.get()):
                 df_atoms = getattr(self.app.state, "df_true_atoms", None)
@@ -9822,7 +12508,7 @@ class PL2DViewerPage(BasePage):
                     xmin_b, xmax_b = float(np.min(x_coords)), float(np.max(x_coords))
                     ymin_b, ymax_b = float(np.min(y_coords)), float(np.max(y_coords))
                     zmin_b, zmax_b = float(np.min(z_coords)), float(np.max(z_coords))
-                    eps_vis = 0.10  # Å
+                    eps_vis = 0.10
 
                     dfp = df_atoms[
                         (df_atoms["X_ANGSTROM"] >= xmin_b + eps_vis) & (df_atoms["X_ANGSTROM"] <= xmax_b - eps_vis) &
@@ -9856,7 +12542,7 @@ class PL2DViewerPage(BasePage):
                             atom_size = 4.0
                         atom_size = max(1.0, min(atom_size, 20.0))
 
-                        # Colors per element (stable, cyclic palette)
+
                         try:
                             palette = pc.qualitative.Dark24
                         except Exception:
@@ -9866,14 +12552,14 @@ class PL2DViewerPage(BasePage):
                         colmap = {sym: palette[i % len(palette)] for i, sym in enumerate(uniq)}
 
                         def _labels(subdf):
-                            idxs = subdf.index.tolist()  # TRUE atom labels (1-based)
+                            idxs = subdf.index.tolist()
                             syms = subdf["_sym"].tolist()
                             return [f"{s}{i}" for s, i in zip(syms, idxs)]
 
                         mode_atoms = "markers+text" if show_labels else "markers"
 
                         if group:
-                            # One trace per element (better legend control)
+
                             for sym in uniq:
                                 sub = dfp[dfp["_sym"] == sym]
                                 if sub.empty:
@@ -9901,7 +12587,7 @@ class PL2DViewerPage(BasePage):
                                     )
                                 )
                         else:
-                            # Single trace (v2 behavior)
+
                             fig.add_trace(
                                 go.Scatter3d(
                                     x=dfp["X_ANGSTROM"],
@@ -9922,13 +12608,10 @@ class PL2DViewerPage(BasePage):
                                 )
                             )
         except Exception:
-            # Never fail plotting due to atoms overlay
+
             pass
 
 
-        # --- Optional overlay: bond paths from TOPOND bond-path attractors ---
-        # Rendered as subtle dotted line segments between the two attractor coordinates
-        # stored for each BCP. This is intentionally lightweight and optional.
         def _add_bond_path_overlay(fig_obj, df_rows: pd.DataFrame, *, name: str = "Bond path") -> None:
             if df_rows is None or df_rows.empty:
                 return
@@ -9940,7 +12623,7 @@ class PL2DViewerPage(BasePage):
                 return
 
             xs, ys, zs = [], [], []
-            n_dots = 22  # denser dotted appearance for a smoother, subtler bond path
+            n_dots = 22
             for _, row in df_rows.iterrows():
                 try:
                     x1 = float(row["ATTR1_X_ANGSTROM"])
@@ -9978,8 +12661,7 @@ class PL2DViewerPage(BasePage):
                 )
             )
 
-        # --- Optional overlay: BCPs (Scatter3d, lightweight) ---
-        # Uses TRHO-parsed BCP table (df_bcp_props) with x/y/z in Å.
+
         cp_legend_flags = {"bcp": False, "rcp": False, "ccp": False}
         cp_legend_groups = {"bcp": "cp_bcp", "rcp": "cp_rcp", "ccp": "cp_ccp"}
         cp_legend_seen = {"bcp": False, "rcp": False, "ccp": False}
@@ -9993,7 +12675,7 @@ class PL2DViewerPage(BasePage):
                     xmin_b, xmax_b = float(np.min(x_coords)), float(np.max(x_coords))
                     ymin_b, ymax_b = float(np.min(y_coords)), float(np.max(y_coords))
                     zmin_b, zmax_b = float(np.min(z_coords)), float(np.max(z_coords))
-                    eps_vis = 0.10  # Å
+                    eps_vis = 0.10
 
                     dfp = df_bcp[
                         (df_bcp["X_ANGSTROM"] >= xmin_b + eps_vis) & (df_bcp["X_ANGSTROM"] <= xmax_b - eps_vis) &
@@ -10015,14 +12697,14 @@ class PL2DViewerPage(BasePage):
                             bcp_size = 4.0
                         bcp_size = max(1.0, min(bcp_size, 30.0))
 
-                        # Elegant and clearly distinct from atoms: open diamond + dark outline.
+
                         symbol = "diamond-open"
 
-                        # Pair label as in v2 (BCP_ELEM = concatenated element symbols)
+
                         if "BCP_ELEM" not in dfp.columns:
                             dfp["BCP_ELEM"] = "BCP"
 
-                        # Colors per pair (stable palette)
+
                         try:
                             palette = pc.qualitative.Set3
                         except Exception:
@@ -10032,7 +12714,7 @@ class PL2DViewerPage(BasePage):
                         colmap = {k: palette[i % len(palette)] for i, k in enumerate(uniq)}
 
                         def _bcp_text(subdf):
-                            # Index is already 1-based in our TRHO parser
+
                             idxs = subdf.index.tolist()
                             if show_labels:
                                 return [f"BCP{int(i)}" for i in idxs]
@@ -10040,7 +12722,7 @@ class PL2DViewerPage(BasePage):
 
                         mode_bcps = "markers+text" if show_labels else "markers"
 
-                        # Build hover with key properties when available
+
                         hover_cols = []
                         hover_labels = {
                             "DIST_ELEM1_ANG": "DIST_(ANG)",
@@ -10057,7 +12739,7 @@ class PL2DViewerPage(BasePage):
 
                         hovertemplate = "<b>BCP%{text}</b><br>" if show_labels else "<b>BCP</b><br>"
                         if hover_cols:
-                            # Add each col line
+
                             for i, col in enumerate(hover_cols):
                                 hovertemplate += f"{hover_labels.get(col, col)}: %{{customdata[{i}]}}<br>"
                         hovertemplate += "x=%{x:.4f} Å<br>y=%{y:.4f} Å<br>z=%{z:.4f} Å<extra></extra>"
@@ -10111,10 +12793,10 @@ class PL2DViewerPage(BasePage):
                             )
                             cp_legend_seen["bcp"] = True
         except Exception:
-            # Never fail plotting due to BCPs overlay
+
             pass
 
-        # --- Optional overlay: RCPs (Ring Critical Points, (3,+1)) ---
+
         try:
             if getattr(self, "var_show_rcps", None) is not None and bool(self.var_show_rcps.get()):
                 parsed_trho = getattr(self.app.state, "trho_parsed", None)
@@ -10123,14 +12805,14 @@ class PL2DViewerPage(BasePage):
                     xmin_b, xmax_b = float(np.min(x_coords)), float(np.max(x_coords))
                     ymin_b, ymax_b = float(np.min(y_coords)), float(np.max(y_coords))
                     zmin_b, zmax_b = float(np.min(z_coords)), float(np.max(z_coords))
-                    eps_vis = 0.10  # Å
+                    eps_vis = 0.10
 
-                    # Ensure numeric CP coordinates (some CRYSTAL outputs carry them as strings)
+
                     _x = pd.to_numeric(df_rcp.get("X_ANGSTROM", pd.Series(dtype=float)), errors="coerce")
                     _y = pd.to_numeric(df_rcp.get("Y_ANGSTROM", pd.Series(dtype=float)), errors="coerce")
                     _z = pd.to_numeric(df_rcp.get("Z_ANGSTROM", pd.Series(dtype=float)), errors="coerce")
 
-                    # Filter by current PL2D box using the same internal visibility margin applied to other markers.
+
                     mask = np.isfinite(_x) & np.isfinite(_y) & np.isfinite(_z) & (_x >= (xmin_b + eps_vis)) & (_x <= (xmax_b - eps_vis)) & (_y >= (ymin_b + eps_vis)) & (_y <= (ymax_b - eps_vis)) & (_z >= (zmin_b + eps_vis)) & (_z <= (zmax_b - eps_vis))
                     dfp = df_rcp.loc[mask].copy()
                     dfp["X_ANGSTROM"] = _x.loc[mask].astype(float)
@@ -10191,19 +12873,17 @@ class PL2DViewerPage(BasePage):
                         )
                         cp_legend_seen["rcp"] = True
         except Exception:
-            # Never fail plotting due to RCPs overlay
+
             pass
 
-        # --- Optional overlay: CCPs (Cage Critical Points, (3,+3)) ---
+
         try:
             if getattr(self, "var_show_ccps", None) is not None and bool(self.var_show_ccps.get()):
                 parsed_trho = getattr(self.app.state, "trho_parsed", None)
                 df_ccp_props = (getattr(parsed_trho, "df_ccp_props", None) if parsed_trho is not None else None)
                 df_ccp_coords = (getattr(parsed_trho, "df_cage", None) if parsed_trho is not None else None)
 
-                # Be conservative here: only expose a CCP legend/trace when there is at least one
-                # real cage-coordinate parsed from TRHO. This avoids false positives from partially
-                # populated property tables or stale/ghost CCP rows.
+
                 if (
                     df_ccp_coords is not None and hasattr(df_ccp_coords, "empty") and (not df_ccp_coords.empty)
                     and df_ccp_props is not None and hasattr(df_ccp_props, "empty") and (not df_ccp_props.empty)
@@ -10211,33 +12891,22 @@ class PL2DViewerPage(BasePage):
                     xmin_b, xmax_b = float(np.min(x_coords)), float(np.max(x_coords))
                     ymin_b, ymax_b = float(np.min(y_coords)), float(np.max(y_coords))
                     zmin_b, zmax_b = float(np.min(z_coords)), float(np.max(z_coords))
-                    # Internal visibility margin for CCPs (Å).
-                    # Empirically tuned from the MgO tests:
-                    #   L=2.0 and 2.1 -> CCP entered the old legend logic but was not visibly rendered;
-                    #   L=2.2         -> CCP became visibly present;
-                    #   L=1.9         -> CCP already disappeared from the legend.
-                    # Because L(side) grows symmetrically around the center, a 0.2 Å change in L
-                    # corresponds to ~0.1 Å per face. Using eps=0.10 Å therefore suppresses edge/
-                    # vertex-near CCPs that are not visually reliable, while keeping clearly visible ones.
+
+
                     eps_ccp = 0.10
 
-                    # Start from the coordinate table, which is the safest source for existence.
-                    # Then join the property columns (same CCP indexing when parsing is correct).
+
                     cols_keep = [c for c in ("RHO", "LAP", "ADIM_RATIO", "BOND_DEGREE", "LAMBDA1", "LAMBDA2", "LAMBDA3", "ELLIP") if c in df_ccp_props.columns]
                     df_ccp = df_ccp_coords.copy()
                     for col in cols_keep:
                         df_ccp[col] = df_ccp_props[col]
 
-                    # Ensure numeric CP coordinates (some CRYSTAL outputs carry them as strings)
+
                     _x = pd.to_numeric(df_ccp.get("X_ANGSTROM", pd.Series(dtype=float)), errors="coerce")
                     _y = pd.to_numeric(df_ccp.get("Y_ANGSTROM", pd.Series(dtype=float)), errors="coerce")
                     _z = pd.to_numeric(df_ccp.get("Z_ANGSTROM", pd.Series(dtype=float)), errors="coerce")
 
-                    # Filter by the current PL2D box using an *internal* margin eps_ccp.
-                    # This avoids creating a CCP legend entry for points that mathematically touch the box
-                    # but are so close to an edge/vertex that they do not render visibly in Plotly.
-                    # Also drop rows that sit exactly on the origin and require at least one meaningful
-                    # CCP property value. This removes ghost rows coming from partially initialized cage arrays.
+
                     finite_mask = np.isfinite(_x) & np.isfinite(_y) & np.isfinite(_z)
                     bounds_mask = (_x >= (xmin_b + eps_ccp)) & (_x <= (xmax_b - eps_ccp)) & (_y >= (ymin_b + eps_ccp)) & (_y <= (ymax_b - eps_ccp)) & (_z >= (zmin_b + eps_ccp)) & (_z <= (zmax_b - eps_ccp))
                     nonzero_coord_mask = (_x.abs() > 1.0e-10) | (_y.abs() > 1.0e-10) | (_z.abs() > 1.0e-10)
@@ -10308,10 +12977,10 @@ class PL2DViewerPage(BasePage):
                         )
                         cp_legend_seen["ccp"] = True
         except Exception:
-            # Never fail plotting due to CCPs overlay
+
             pass
 
-        # --- Optional overlay: NNA (flagged non-nuclear attractors, (3,-3)) ---
+
         try:
             if getattr(self, "var_show_nna", None) is not None and bool(self.var_show_nna.get()):
                 parsed_trho = getattr(self.app.state, "trho_parsed", None)
@@ -10320,7 +12989,7 @@ class PL2DViewerPage(BasePage):
                     xmin_b, xmax_b = float(np.min(x_coords)), float(np.max(x_coords))
                     ymin_b, ymax_b = float(np.min(y_coords)), float(np.max(y_coords))
                     zmin_b, zmax_b = float(np.min(z_coords)), float(np.max(z_coords))
-                    eps_vis = 0.10  # Å
+                    eps_vis = 0.10
 
                     _x = pd.to_numeric(df_nna.get("X_ANGSTROM", pd.Series(dtype=float)), errors="coerce")
                     _y = pd.to_numeric(df_nna.get("Y_ANGSTROM", pd.Series(dtype=float)), errors="coerce")
@@ -10393,13 +13062,10 @@ class PL2DViewerPage(BasePage):
                             )
                         )
         except Exception:
-            # Never fail plotting due to NNA overlay
+
             pass
 
-        # --- CP legend proxies (2D Scatter) ---
-        # Use lightweight 2D legend-only traces so the legend symbol/color matches exactly
-        # while clicks still toggle the real 3D traces through legendgroup.
-        # Re-check CCP directly from the figure traces to avoid any stale flag creating a false legend item.
+
         try:
             ccp_trace_present = False
             for tr in getattr(fig, "data", ()):
@@ -10477,10 +13143,7 @@ class PL2DViewerPage(BasePage):
             xaxis=dict(visible=False, showgrid=False, zeroline=False),
             yaxis=dict(visible=False, showgrid=False, zeroline=False),
         )
-        self.lbl_status.config(text=f"Plotting {surf}… (this opens in your browser window)")
-
-        # Optional: export HTML (v2-like behavior)
-        if getattr(self, "var_save_html", None) is not None and self.var_save_html.get():
+        if export_html:
             try:
                 out_dir = Path(rd)
                 out_dir.mkdir(parents=True, exist_ok=True)
@@ -10491,7 +13154,6 @@ class PL2DViewerPage(BasePage):
                 base = _sanitize(out_dir.name)
                 surf_tag = _sanitize(surf)
 
-                # Match v2 naming style: replace '.' so filenames stay clean
                 try:
                     if (self.var_mode.get().strip() == "geometric") and ("levels" in locals()) and levels:
                         mi_val = min(levels)
@@ -10508,29 +13170,33 @@ class PL2DViewerPage(BasePage):
                 html_name = f"{base}_{surf_tag}_{mi}_{mx}.html"
                 html_path = out_dir / html_name
 
-                fig.write_html(str(html_path), include_plotlyjs="directory")
-                self.lbl_status.config(text=f"Saved HTML: {html_path}")
+                fig.write_html(str(html_path), include_plotlyjs=True)
+                self.lbl_status.config(text=f"Saved HTML: {html_path.name}")
+                messagebox.showinfo("PL2D Viewer", f"HTML file saved successfully.\n\n{html_path}", parent=self)
             except Exception as e:
                 self.lbl_status.config(text=f"HTML export failed: {e}")
-        fig.show()
+                messagebox.showerror("PL2D Viewer", f"HTML export failed:\n\n{e}", parent=self)
+            return
+
+        self.lbl_status.config(text=f"Plotting {surf}… (this opens in your browser window)")
+        _show_plotly_figure(fig)
         self.lbl_status.config(text="Done.")
 
     def refresh_state(self):
-        # PL2D Viewer must work even when TRHO prerequisites are missing (no fort.9 / *.f9).
-        # We only require that a folder was selected and that a valid run folder is selected.
+
+
         ws = self.app.ctx.workspace_dir
         has_ws = bool(ws)
 
-        # Allow selecting runs even if workspace_ok is False
+
         self.cmb_runs.configure(state=("readonly" if has_ws else "disabled"))
 
-        # Enable plot only when a run is selected AND a SURF*.DAT is selected.
+
         run_selected = bool(self.run_var.get().strip())
         surf_selected = bool(self.surf_var.get().strip())
-        self.btn_plot.configure(state=("normal" if has_ws and run_selected and surf_selected else "disabled"))
-        self.app.ctx.pl2d_view_ready = bool(has_ws and run_selected and surf_selected)
-
-
+        ready = bool(has_ws and run_selected and surf_selected)
+        self._set_action_buttons_state(ready)
+        self.app.ctx.pl2d_view_ready = ready
 
 
 class DataFrameTable(ttk.Frame):
@@ -10550,8 +13216,13 @@ class DataFrameTable(ttk.Frame):
         self._column_widths: Dict[str, int] = {}
         self._tree_col_ids: List[str] = []
         self._tree_col_labels: List[str] = []
+        self._heading_tip_window = None
+        self._heading_tip_after_id = None
+        self._heading_tip_col: Optional[int] = None
+        self._heading_tip_text = ""
+        self._heading_tip_xy = (0, 0)
 
-        # Top bar: title + filter
+
         top = ttk.Frame(self)
         top.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         top.columnconfigure(1, weight=1)
@@ -10582,7 +13253,7 @@ class DataFrameTable(ttk.Frame):
             row=1, column=0, columnspan=4, sticky="w", pady=(6, 0)
         )
 
-        # Treeview + scrollbars
+
         body = ttk.Frame(self)
         body.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
         self.rowconfigure(1, weight=1)
@@ -10592,6 +13263,9 @@ class DataFrameTable(ttk.Frame):
 
         self.tree = ttk.Treeview(body, show="headings")
         self.tree.grid(row=0, column=0, sticky="nsew")
+        self.tree.bind("<Motion>", self._on_tree_motion_for_tooltip, add=True)
+        self.tree.bind("<Leave>", self._hide_heading_tooltip, add=True)
+        self.tree.bind("<ButtonPress>", self._hide_heading_tooltip, add=True)
 
         vsb = ttk.Scrollbar(body, orient="vertical", command=self.tree.yview)
         hsb = ttk.Scrollbar(body, orient="horizontal", command=self.tree.xview)
@@ -10599,7 +13273,7 @@ class DataFrameTable(ttk.Frame):
         vsb.grid(row=0, column=1, sticky="ns")
         hsb.grid(row=1, column=0, sticky="ew")
 
-        # Bottom bar
+
         bottom = ttk.Frame(self)
         bottom.grid(row=2, column=0, sticky="ew", pady=(6, 0))
         bottom.columnconfigure(0, weight=1)
@@ -10631,7 +13305,10 @@ class DataFrameTable(ttk.Frame):
         return f"c{idx}"
 
     def _column_anchor(self, colname: str, series: Optional[pd.Series] = None) -> str:
-        if str(colname).upper() == "N":
+        up = str(colname).upper()
+
+
+        if up in {"N", "TOPOND_CP_N", "BCP_ELEM", "ELEM1", "ELEM2", "CP_ATOMS"}:
             return "center"
         if series is not None:
             try:
@@ -10641,27 +13318,220 @@ class DataFrameTable(ttk.Frame):
                 pass
         return "w"
 
+    def _display_column_label(self, colname: str) -> str:
+        """Return the GUI-only label for a DataFrame column.
+
+        The underlying DataFrame/export column names are intentionally preserved
+        (ASCII/script-friendly).  This alias layer is used only in Tk tables so
+        Reports can use concise scientific symbols without breaking XLSX/CSV
+        workflows or downstream pandas/R/Origin scripts.
+        """
+        name = str(colname)
+        aliases = {
+
+            "TOPOND_CP_N": "TOPOND",
+            "CP_ATOMS": "CP_ATOMS",
+
+
+            "DIST_(ANG)": "D_BCP",
+            "DIST_ANG": "D_BCP",
+            "DIST_ELEM1_ANG": "D_BCP",
+            "DIST_ELEM2_ANG": "D_BCP",
+            "X_ANGSTROM": "X",
+            "Y_ANGSTROM": "Y",
+            "Z_ANGSTROM": "Z",
+            "ATOM_X_ANGSTROM": "X(atom)",
+            "ATOM_Y_ANGSTROM": "Y(atom)",
+            "ATOM_Z_ANGSTROM": "Z(atom)",
+            "ATTR1_X_ANGSTROM": "X₁",
+            "ATTR1_Y_ANGSTROM": "Y₁",
+            "ATTR1_Z_ANGSTROM": "Z₁",
+            "ATTR2_X_ANGSTROM": "X₂",
+            "ATTR2_Y_ANGSTROM": "Y₂",
+            "ATTR2_Z_ANGSTROM": "Z₂",
+            "BPL_ANG": "BPL",
+            "RAB_ANG": "RAB",
+            "BPL_OVER_RAB": "BPL/RAB",
+
+
+            "RHO": "ρ",
+            "GRHO": "|∇ρ|",
+            "LAPL": "∇²ρ",
+            "LAP": "∇²ρ",
+            "LAMBDA1": "λ₁",
+            "LAMBDA2": "λ₂",
+            "LAMBDA3": "λ₃",
+            "ELLIP": "ε",
+            "ELLIPTICITY": "ε",
+
+
+            "GKIN": "G",
+            "KKIN": "K",
+            "VIRIAL": "V",
+            "ADIM_RATIO": "|V|/G",
+            "BOND_DEGREE": "H/ρ",
+        }
+        return aliases.get(name, name)
+
+    def _column_tooltip_text(self, colname: str) -> str:
+        """Return a short explanation for a GUI table column header."""
+        name = str(colname)
+        tips = {
+
+            "N": "TopIso3D internal CP index used for selection and PL2D-centered workflows.",
+            "TOPOND_CP_N": "Original critical-point number reported by TOPOND in the output file.",
+            "BCP_ELEM": "Element pair associated with the bond critical point.",
+            "ELEM1": "First atom connected to the BCP by the bond path.",
+            "ELEM2": "Second atom connected to the BCP by the bond path.",
+            "CP_ATOMS": "Atoms listed by TOPOND in the local \"CLUSTER OF ATOMS AROUND THE CP\" section. Only the first 6 atoms are shown here; \"...\" indicates additional atoms. The full list is preserved in the exported report.",
+            "CP_CLUSTER_ATOMS": "Full list of atoms in TOPOND's local cluster around the CP.",
+            "CP_CLUSTER_DISTANCES_ANG": "Distances (Å) for the atoms listed in CP_CLUSTER_ATOMS.",
+            "CP_CLUSTER_N_ATOMS": "Number of atoms listed by TOPOND in the local cluster around the CP.",
+
+
+            "DIST_(ANG)": "Distance from the BCP to the connected atom (Å).",
+            "DIST_ANG": "Distance from the BCP to the connected atom (Å).",
+            "DIST_ELEM1_ANG": "Distance from the BCP to ELEM1 (Å).",
+            "DIST_ELEM2_ANG": "Distance from the BCP to ELEM2 (Å).",
+            "X_ANGSTROM": "X coordinate in Å.",
+            "Y_ANGSTROM": "Y coordinate in Å.",
+            "Z_ANGSTROM": "Z coordinate in Å.",
+            "BPL_ANG": "Bond-path length (Å): sum of the two BCP-to-attractor path lengths.",
+            "RAB_ANG": "Direct internuclear distance between the two connected atoms (Å).",
+            "BPL_OVER_RAB": "Bond-path curvature indicator. Values close to 1 indicate an almost straight bond path.",
+            "ATTR1_TRAJ_LEN_ANG": "Trajectory length from the BCP to attractor 1 along the bond path (Å).",
+            "ATTR2_TRAJ_LEN_ANG": "Trajectory length from the BCP to attractor 2 along the bond path (Å).",
+
+
+            "RHO": "Electron density at the critical point, ρ(r).",
+            "GRHO": "Magnitude of the electron-density gradient, |∇ρ|.",
+            "LAPL": "Laplacian of the electron density, ∇²ρ.",
+            "LAP": "Laplacian of the electron density, ∇²ρ.",
+            "LAMBDA1": "First Hessian eigenvalue of ρ at the critical point.",
+            "LAMBDA2": "Second Hessian eigenvalue of ρ at the critical point.",
+            "LAMBDA3": "Third Hessian eigenvalue of ρ at the critical point.",
+            "ELLIP": "Ellipticity, ε, measuring anisotropy perpendicular to the bond path.",
+            "ELLIPTICITY": "Ellipticity, ε, measuring anisotropy perpendicular to the bond path.",
+
+
+            "GKIN": "Local kinetic energy density G(r).",
+            "KKIN": "Alternative kinetic-energy density descriptor reported by TOPOND.",
+            "VIRIAL": "Local potential/virial energy density V(r).",
+            "ADIM_RATIO": "Dimensionless ratio |V|/G.",
+            "BOND_DEGREE": "Bond-degree descriptor H/ρ, where H = G + V.",
+            "ELF": "Electron localization function at the critical point.",
+        }
+        return tips.get(name, "")
+
+    def _on_tree_motion_for_tooltip(self, event=None):
+        """Show tooltips only when the mouse is over a Treeview heading."""
+        try:
+            region = self.tree.identify_region(event.x, event.y)
+        except Exception:
+            self._hide_heading_tooltip()
+            return
+        if region != "heading":
+            self._hide_heading_tooltip()
+            return
+        try:
+            col_token = self.tree.identify_column(event.x)
+            idx = int(str(col_token).replace("#", "")) - 1
+        except Exception:
+            self._hide_heading_tooltip()
+            return
+        if idx < 0 or idx >= len(self._tree_col_labels):
+            self._hide_heading_tooltip()
+            return
+        text = self._column_tooltip_text(self._label_at(idx))
+        if not text:
+            self._hide_heading_tooltip()
+            return
+        try:
+            xy = (int(event.x_root) + 14, int(event.y_root) + 18)
+        except Exception:
+            xy = (0, 0)
+        if self._heading_tip_col == idx and self._heading_tip_window is not None:
+            return
+        self._hide_heading_tooltip()
+        self._heading_tip_col = idx
+        self._heading_tip_text = text
+        self._heading_tip_xy = xy
+        try:
+            self._heading_tip_after_id = self.tree.after(500, self._show_heading_tooltip)
+        except Exception:
+            self._show_heading_tooltip()
+
+    def _show_heading_tooltip(self):
+        self._heading_tip_after_id = None
+        text = str(getattr(self, "_heading_tip_text", "") or "")
+        if not text:
+            return
+        try:
+            x, y = self._heading_tip_xy
+            tw = tk.Toplevel(self.tree)
+            self._heading_tip_window = tw
+            tw.wm_overrideredirect(True)
+            tw.wm_geometry(f"+{x}+{y}")
+            lbl = tk.Label(
+                tw,
+                text=text,
+                justify="left",
+                background="#ffffe0",
+                relief="solid",
+                borderwidth=1,
+                wraplength=360,
+                font=("TkDefaultFont", 9),
+            )
+            lbl.pack(ipadx=6, ipady=4)
+        except Exception:
+            self._heading_tip_window = None
+
+    def _hide_heading_tooltip(self, event=None):
+        try:
+            if self._heading_tip_after_id is not None:
+                self.tree.after_cancel(self._heading_tip_after_id)
+        except Exception:
+            pass
+        self._heading_tip_after_id = None
+        self._heading_tip_col = None
+        tw = getattr(self, "_heading_tip_window", None)
+        self._heading_tip_window = None
+        if tw is not None:
+            try:
+                tw.destroy()
+            except Exception:
+                pass
+
     def _heading_text(self, col_idx: int) -> str:
-        label = self._label_at(col_idx)
+        label = self._display_column_label(self._label_at(col_idx))
         if self._sort_col == col_idx:
             label += " ↑" if self._sort_ascending else " ↓"
         return label
 
     def _preferred_width(self, colname: str, series: Optional[pd.Series] = None) -> int:
         name = str(colname)
+        display_name = self._display_column_label(name)
         up = name.upper()
         if up == "N":
             return 70
+        if up == "TOPOND_CP_N":
+            return 85
         if up in {"BCP_ELEM", "ELEM1", "ELEM2"}:
             return 90
+        if up == "CP_ATOMS":
+            return 230
+        if up in {"DIST_(ANG)", "DIST_ANG", "DIST_ELEM1_ANG", "DIST_ELEM2_ANG"}:
+            return 95
+        if up in {"BPL_ANG", "RAB_ANG", "BPL_OVER_RAB"}:
+            return 85
         if "ANG" in up:
             return 90
-        if up in {"RHO", "GRHO", "GKIN", "KKIN", "VIRIAL", "ELF", "ELLIP", "LAP", "LAMI1", "LAMI2", "LAMI3"}:
+        if up in {"RHO", "GRHO", "GKIN", "KKIN", "VIRIAL", "ELF", "ELLIP", "LAP", "LAPL", "LAMBDA1", "LAMBDA2", "LAMBDA3"}:
             return 90
         if up in {"ADIM_RATIO", "BOND_DEGREE"}:
-            return 110
+            return 90
 
-        header_w = max(90, min(220, 10 * len(name) + 18))
+        header_w = max(90, min(220, 10 * len(display_name) + 18))
         value_w = 0
         if series is not None:
             try:
@@ -10673,7 +13543,7 @@ class DataFrameTable(ttk.Frame):
         return max(header_w, value_w)
 
     def _build_from_df(self, df: pd.DataFrame):
-        # Clear tree
+
         for col in self.tree["columns"]:
             self.tree.heading(col, text="")
         self.tree.delete(*self.tree.get_children())
@@ -10691,7 +13561,7 @@ class DataFrameTable(ttk.Frame):
         self._tree_col_ids = [self._tree_id_at(i) for i in range(len(self._tree_col_labels))]
         self.tree["columns"] = self._tree_col_ids
 
-        # Configure columns (preserve widths across sorting/filtering; do not auto-shrink to fit window)
+
         for i, cid in enumerate(self._tree_col_ids):
             label = self._label_at(i)
             series = self._series_at(df, i)
@@ -10701,8 +13571,8 @@ class DataFrameTable(ttk.Frame):
             self._column_widths[width_key] = width
             self.tree.column(cid, width=width, minwidth=max(60, min(width, 90)), anchor=self._column_anchor(label, series), stretch=False)
 
-        # Insert rows (stringified; keep light)
-        max_rows = 2000  # guard: avoid freezing UI on huge tables
+
+        max_rows = 2000
         shown = min(len(df), max_rows)
         for i in range(shown):
             row = df.iloc[i]
@@ -10764,7 +13634,7 @@ class DataFrameTable(ttk.Frame):
             return
 
         df = self._df_full
-        # Simple contains filter across all columns (string form)
+
         mask = np.zeros(len(df), dtype=bool)
         for j in range(len(df.columns)):
             try:
@@ -10790,6 +13660,7 @@ class ReportViewerWindow(tk.Toplevel):
         self.title("TopIso3D v2026 — Reports Viewer")
         self.geometry("1100x720")
         self.minsize(980, 600)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         outer = ttk.Frame(self, padding=10)
         outer.pack(fill="both", expand=True)
@@ -10812,7 +13683,7 @@ class ReportViewerWindow(tk.Toplevel):
         self.nb = ttk.Notebook(outer)
         self.nb.pack(fill="both", expand=True)
 
-        # Tabs
+
         self.tab_summary = ttk.Frame(self.nb)
         self.tab_atoms = ttk.Frame(self.nb)
         self.tab_nna = ttk.Frame(self.nb)
@@ -10827,12 +13698,12 @@ class ReportViewerWindow(tk.Toplevel):
         self.nb.add(self.tab_rcp, text="RCP")
         self.nb.add(self.tab_ccp, text="CCP")
 
-        # Summary content
+
         self.summary_text = tk.Text(self.tab_summary, wrap="word", height=20)
         self.summary_text.pack(fill="both", expand=True, padx=8, pady=8)
         self.summary_text.configure(state="disabled")
 
-        # Tables
+
         self.tbl_atoms = DataFrameTable(self.tab_atoms, title="TRUE atoms")
         self.tbl_atoms.pack(fill="both", expand=True, padx=8, pady=8)
 
@@ -10841,7 +13712,7 @@ class ReportViewerWindow(tk.Toplevel):
         self.tbl_nna = DataFrameTable(self.tab_nna, title="NNA")
         self.tbl_nna.pack(fill="both", expand=True, padx=8, pady=8)
 
-        # --- BCP tab: evaluation plots + table ---
+
         bcp_outer = ttk.Frame(self.tab_bcp)
         bcp_outer.pack(fill="both", expand=True, padx=8, pady=8)
         bcp_top = ttk.Frame(bcp_outer)
@@ -10857,7 +13728,28 @@ class ReportViewerWindow(tk.Toplevel):
         self.tbl_ccp = DataFrameTable(self.tab_ccp, title="CCP properties")
         self.tbl_ccp.pack(fill="both", expand=True, padx=8, pady=8)
 
-        self.refresh()
+
+        try:
+            self.after_idle(self.refresh)
+        except Exception:
+            self.refresh()
+
+    def _on_close(self):
+        """Close Reports Viewer cleanly and clear the app-side reference.
+
+        The window protocol references this method during __init__.  Without it,
+        Tk creates the Toplevel and then raises AttributeError before the widgets
+        are fully built, which appears on macOS as a blank Reports window.
+        """
+        try:
+            if getattr(self.app, "_report_viewer_win", None) is self:
+                self.app._report_viewer_win = None
+        except Exception:
+            pass
+        try:
+            self.destroy()
+        except Exception:
+            pass
 
     def refresh(self):
         ctx = self.app.ctx
@@ -10921,17 +13813,43 @@ class ReportViewerWindow(tk.Toplevel):
             if df is None or df.empty:
                 return df
             hidden_in_report = {"ATTR1_ATOM_ID", "ATTR2_ATOM_ID", "ATTR1_TRAJ_LEN_ANG", "ATTR2_TRAJ_LEN_ANG", "ATTR1_X_ANGSTROM", "ATTR1_Y_ANGSTROM", "ATTR1_Z_ANGSTROM", "ATTR2_X_ANGSTROM", "ATTR2_Y_ANGSTROM", "ATTR2_Z_ANGSTROM"}
-            preferred = ["N", "BCP_ELEM", "ELEM1", "DIST_ELEM1_ANG", "ELEM2", "DIST_ELEM2_ANG"]
+            preferred = ["N", "TOPOND_CP_N", "BCP_ELEM", "ELEM1", "DIST_ELEM1_ANG", "ELEM2", "DIST_ELEM2_ANG"]
             visible_cols = [c for c in df.columns if c not in hidden_in_report]
             cols = [c for c in preferred if c in visible_cols] + [c for c in visible_cols if c not in preferred]
-            return _compact_bcp_dist_headers(df.loc[:, cols].copy())
+            return _compact_bcp_dist_headers(_reorder_bcp_report_columns(df.loc[:, cols].copy()))
+
+        def _rcp_ccp_gui_columns(df: pd.DataFrame) -> pd.DataFrame:
+            """Return the GUI view for RCP/CCP tables.
+
+            The full TOPOND cluster list is preserved in XLSX/CSV exports.  The GUI
+            shows only CP_ATOMS (up to 6 atoms plus "...") to avoid very wide tables,
+            because the cluster size depends on the TOPOND input.
+            """
+            if df is None or df.empty:
+                return df
+            out = df.copy()
+
+
+            out = out.drop(
+                columns=[
+                    c for c in (
+                        "ELLIP", "ELLIPTICITY",
+                        "CP_CLUSTER_ATOMS", "CP_CLUSTER_DISTANCES_ANG", "CP_CLUSTER_N_ATOMS",
+                    )
+                    if c in out.columns
+                ],
+                errors="ignore",
+            )
+            preferred = [c for c in ("N", "TOPOND_CP_N", "CP_ATOMS") if c in out.columns]
+            rest = [c for c in out.columns if c not in preferred]
+            return out.loc[:, preferred + rest]
         self.tbl_atoms.set_df(_with_seq(df_true), title=f"TRUE atoms ({ntrue}) — selection index: N")
         nna_cutoff = float(getattr(parsed, "nna_cutoff_ang", getattr(ctx, "nna_cutoff_ang", 0.35)) or 0.35)
         self.nna_info_var.set(f"Classification cutoff: {nna_cutoff:.3f} Å. Flagged (3,-3) attractors with d_min ≤ cutoff are labeled 'likely pseudopotential artifact'; otherwise 'likely NNA'.")
         self.tbl_nna.set_df(_with_seq(df_nna), title=f"NNA ({nnna}) — selection index: N")
         self.tbl_bcp.set_df(_reorder_bcp_columns(_with_seq(df_bcp)), title=f"BCP ({nbcp}) — selection index: N")
-        self.tbl_rcp.set_df(_with_seq(df_rcp), title=f"RCP ({nrcp}) — selection index: N")
-        self.tbl_ccp.set_df(_with_seq(df_ccp), title=f"CCP ({nccp}) — selection index: N")
+        self.tbl_rcp.set_df(_with_seq(_rcp_ccp_gui_columns(df_rcp)), title=f"RCP ({nrcp}) — selection index: N")
+        self.tbl_ccp.set_df(_with_seq(_rcp_ccp_gui_columns(df_ccp)), title=f"CCP ({nccp}) — selection index: N")
         lines = []
         ws = ctx.workspace_dir if ctx.workspace_dir else None
         if ws:
@@ -11022,13 +13940,13 @@ class ReportViewerWindow(tk.Toplevel):
             messagebox.showwarning("BCP evaluation", "No BCP properties available (run/parse TRHO first).")
             return
         df = parsed.df_bcp_props.copy()
-        # Ensure BCP id and label exist for hover
+
         df["BCP_ID"] = df.index.astype(int)
         df["BCP_LABEL"] = df["BCP_ID"].apply(lambda i: f"BCP{i}")
         if "BCP_ELEM" not in df.columns:
             df["BCP_ELEM"] = "BCP"
 
-        # Choose a concise set of hover fields (only if present)
+
         if "DIST_ELEM1_ANG" in df.columns:
             df["DIST_(ANG)_1"] = df["DIST_ELEM1_ANG"]
         if "DIST_ELEM2_ANG" in df.columns:
@@ -11061,9 +13979,9 @@ class ReportViewerWindow(tk.Toplevel):
             )
             fig4.update_traces(marker=dict(size=12, line=dict(width=1, color="DarkSlateGrey")))
 
-            fig2.show()
-            fig3.show()
-            fig4.show()
+            _show_plotly_figure(fig2)
+            _show_plotly_figure(fig3)
+            _show_plotly_figure(fig4)
         except Exception as e:
             messagebox.showerror("BCP evaluation", f"Failed to build plots: {e}")
 
@@ -11074,7 +13992,7 @@ class ReportViewerWindow(tk.Toplevel):
         self.summary_text.configure(state="disabled")
 
     def _export_excel(self):
-        # Reuse ReportsPage logic (write to workspace)
+
         page = self.app.pages.get("Reports")
         if page and hasattr(page, "export_xlsx"):
             page.export_xlsx()
@@ -11085,15 +14003,6 @@ class ReportViewerWindow(tk.Toplevel):
             page.export_csv()
 
 
-
-# -----------------------------
-# BCP Evaluation Page (3 classic plots)
-# -----------------------------
-
-
-# -----------------------------
-# ATBP Page (STD-only, Phase 1)
-# -----------------------------
 class ATBPPage(BasePage):
     title = "ATBP"
 
@@ -11103,6 +14012,7 @@ class ATBPPage(BasePage):
         self.run_dir: Optional[Path] = None
         self.df_atbp: Optional[pd.DataFrame] = None
         self._last_workspace_dir: Optional[Path] = None
+        self._atbp_run_options: Dict[str, Path] = {}
 
     def _build(self):
         super()._build()
@@ -11116,12 +14026,22 @@ class ATBPPage(BasePage):
             font=("TkDefaultFont", 11, "bold"),
         ).pack(anchor="w", pady=(0, 10))
 
-        frm_out = ttk.LabelFrame(body, text="ATBP run / output (workspace/atbp)")
+        frm_out = ttk.LabelFrame(body, text="ATBP run / output (workspace/atbp_runs)")
         frm_out.pack(fill="x", pady=(0, 10))
 
         self.var_include_topo = tk.BooleanVar(value=True)
         self.var_atbp_mode = tk.StringVar(value="STD")
         self.var_out = tk.StringVar(value="")
+        self.var_atbp_run = tk.StringVar(value="—")
+
+        row_runs = ttk.Frame(frm_out)
+        row_runs.pack(fill="x", padx=10, pady=(10, 4))
+        ttk.Label(row_runs, text="Existing ATBP runs (workspace/atbp_runs)").pack(side="left")
+        self.cmb_atbp_runs = ttk.Combobox(row_runs, textvariable=self.var_atbp_run, values=(), state="readonly", width=42)
+        self.cmb_atbp_runs.pack(side="left", fill="x", expand=True, padx=(10, 8))
+        self.cmb_atbp_runs.bind("<<ComboboxSelected>>", self._on_select_run)
+        self.btn_refresh_runs = ttk.Button(row_runs, text="Refresh list", command=self._refresh_run_selector)
+        self.btn_refresh_runs.pack(side="left")
 
         row1 = ttk.Frame(frm_out)
         row1.pack(fill="x", padx=10, pady=10)
@@ -11146,8 +14066,12 @@ class ATBPPage(BasePage):
         except Exception:
             pass
 
+        self.btn_abort = ttk.Button(row1, text="Abort", command=lambda: self.app.abort_current_job("ATBP"))
+        self.btn_abort.pack(side="right")
+        self.btn_abort.configure(state="disabled")
+
         self.btn_run = ttk.Button(row1, text="Run ATBP", command=self._run_atbp)
-        self.btn_run.pack(side="right")
+        self.btn_run.pack(side="right", padx=(0, 8))
 
         self._pb_row = ttk.Frame(frm_out)
         self._pb_row.pack(fill="x", padx=10, pady=(0, 10))
@@ -11184,13 +14108,53 @@ class ATBPPage(BasePage):
         vsb.pack(side="right", fill="y", padx=(0, 10), pady=(0, 10))
 
     def on_show(self):
+        self._refresh_run_selector()
         self._sync_output_path()
+        self.refresh_state()
+
+    def _refresh_run_selector(self):
+        try:
+            values, options, active_label = self.app._get_atbp_run_selector_data()
+        except Exception:
+            values, options, active_label = [], {}, "—"
+        self._atbp_run_options = options
+        try:
+            self.cmb_atbp_runs.configure(values=values)
+        except Exception:
+            pass
+        if values:
+            try:
+                if self.var_atbp_run.get() not in options:
+                    self.var_atbp_run.set(active_label)
+            except Exception:
+                self.var_atbp_run.set(active_label)
+        else:
+            self.var_atbp_run.set("—")
+
+    def _on_select_run(self, _event=None):
+        label = str(self.var_atbp_run.get() or "").strip()
+        run_dir = self._atbp_run_options.get(label)
+        if run_dir is None:
+            return
+        try:
+            self.app._set_active_atbp_run(run_dir)
+        except Exception:
+            return
+        self._sync_output_path()
+        try:
+            self._parse_output(silent=True)
+        except Exception:
+            pass
         self.refresh_state()
 
     def _clear_current_results(self) -> None:
         self.df_atbp = None
         try:
             self.app.ctx.df_atbp = None
+        except Exception:
+            pass
+        try:
+            self.app.ctx.atbp_out_path = None
         except Exception:
             pass
         try:
@@ -11205,35 +14169,62 @@ class ATBPPage(BasePage):
             if ws_changed:
                 self._last_workspace_dir = ws
                 self._clear_current_results()
+                self._refresh_run_selector()
                 try:
                     self.lbl_status.config(text="—")
                 except Exception:
                     pass
 
             if ws and ws.exists():
-                cand = ws / "atbp" / "atbp.out"
-                if cand.exists():
+                active_run = None
+                try:
+                    sel = self._atbp_run_options.get(str(self.var_atbp_run.get() or "").strip())
+                    active_run = sel if sel is not None else self.app._get_active_atbp_dir()
+                except Exception:
+                    active_run = None
+                cand = self.app._find_matching_output_in_dirs([active_run], self.app._configured_output_names("atbp")) if active_run is not None else None
+                if cand is not None and cand.exists():
                     if self.out_path != cand:
                         self._clear_current_results()
                     self.out_path = cand
                     self.run_dir = cand.parent
                     self.var_out.set(str(cand))
                     self.app.ctx.atbp_out_path = cand
+                    try:
+                        self.app.ctx.atbp_run_dir = self.run_dir
+                    except Exception:
+                        pass
                 else:
+                    had_results = self.df_atbp is not None and not getattr(self.df_atbp, "empty", True)
                     self.out_path = None
-                    self.run_dir = ws / "atbp"
-                    self.var_out.set(str(self.run_dir / "atbp.out"))
+                    base_dir = (ws / "atbp_runs")
+                    self.run_dir = active_run if active_run is not None else base_dir
+                    preferred_name = self.app._preferred_output_name("atbp", "atbp.out")
+                    default_dir = self.run_dir if self.run_dir is not None else (base_dir / "atbp_001")
+                    self.var_out.set(str(default_dir / preferred_name))
                     self.app.ctx.atbp_out_path = None
-                    if ws_changed:
-                        try:
-                            self.lbl_status.config(text=f"No ATBP output found yet for current workspace: {self.run_dir}")
-                        except Exception:
-                            pass
+                    try:
+                        self.app.ctx.atbp_run_dir = self.run_dir
+                    except Exception:
+                        pass
+                    if had_results or ws_changed:
+                        self._clear_current_results()
+                    try:
+                        if active_run is not None:
+                            self.lbl_status.config(text=f"No ATBP output found for selected run: {Path(active_run).name}")
+                        else:
+                            self.lbl_status.config(text=f"No ATBP output found yet for current workspace: {base_dir}")
+                    except Exception:
+                        pass
             else:
                 self.out_path = None
                 self.run_dir = None
                 self.var_out.set("")
                 self.app.ctx.atbp_out_path = None
+                try:
+                    self.app.ctx.atbp_run_dir = None
+                except Exception:
+                    pass
                 if ws_changed:
                     try:
                         self.lbl_status.config(text="—")
@@ -11247,10 +14238,17 @@ class ATBPPage(BasePage):
             if running:
                 self.lbl_runhint.configure(text=hint or "Running… (ATBP may take a long time)")
                 self.pb.start(12)
-                self.btn_run.configure(state="disabled")
+                if hasattr(self, "btn_run"):
+                    self.btn_run.configure(state="disabled")
+                if hasattr(self, "btn_abort"):
+                    self.btn_abort.configure(state="normal")
             else:
                 self.pb.stop()
                 self.lbl_runhint.configure(text=" ")
+                if hasattr(self, "btn_run"):
+                    self.btn_run.configure(state=("normal" if (getattr(self.app.ctx, "workspace_compute_ok", False) and self.app.ctx.trho_done and (not self.app._job_running)) else "disabled"))
+                if hasattr(self, "btn_abort"):
+                    self.btn_abort.configure(state="disabled")
         except Exception:
             pass
 
@@ -11315,18 +14313,32 @@ class ATBPPage(BasePage):
 
     def on_atbp_done(self, out_path: Optional[Path] = None) -> None:
         try:
+            self._refresh_run_selector()
             if out_path is not None:
                 self.out_path = Path(out_path)
                 self.run_dir = self.out_path.parent
                 self.var_out.set(str(self.out_path))
                 self.app.ctx.atbp_out_path = self.out_path
+                try:
+                    self.app.ctx.atbp_run_dir = self.run_dir
+                except Exception:
+                    pass
+
+                try:
+                    values, options, active_label = self.app._get_atbp_run_selector_data()
+                    self._atbp_run_options = options
+                    self.cmb_atbp_runs.configure(values=values)
+                    if active_label != "—":
+                        self.var_atbp_run.set(active_label)
+                except Exception:
+                    pass
                 self._parse_output(silent=True)
         finally:
             self._set_running(False)
 
     def on_atbp_fail(self, msg: Optional[str] = None) -> None:
         self._set_running(False)
-        if msg:
+        if msg and ("aborted" not in str(msg).lower()):
             messagebox.showerror("ATBP", msg)
 
     def _parse_output(self, silent: bool = False):
@@ -11337,14 +14349,27 @@ class ATBPPage(BasePage):
                     messagebox.showwarning("ATBP", "No workspace selected. Go to Workspace page first.")
                 return
 
-            self.run_dir = ensure_atbp_dir(ws)
-            outp = self.run_dir / "atbp.out"
+            active_run = self._atbp_run_options.get(str(self.var_atbp_run.get() or "").strip())
+            if active_run is None:
+                active_run = self.app._get_active_atbp_dir()
+            if active_run is None:
+                active_run = self.run_dir if self.run_dir is not None else (ws / "atbp_runs")
+            self.run_dir = active_run
+            outp = self.app._find_matching_output_in_dirs([self.run_dir], self.app._configured_output_names("atbp"))
+            if outp is None:
+                outp = self.run_dir / self.app._preferred_output_name("atbp", "atbp.out")
             self.out_path = outp
             self.var_out.set(str(outp))
             self.app.ctx.atbp_out_path = outp if outp.exists() else None
 
             if not outp.exists():
-                self.lbl_status.config(text="No ATBP output found yet.")
+                self._clear_current_results()
+                self.out_path = None
+                self.app.ctx.atbp_out_path = None
+                try:
+                    self.lbl_status.config(text=f"No ATBP output found for selected run: {Path(self.run_dir).name}")
+                except Exception:
+                    self.lbl_status.config(text="No ATBP output found yet.")
                 if not silent:
                     messagebox.showwarning("ATBP", f"ATBP output not found:\n{outp}")
                 return
@@ -11371,8 +14396,9 @@ class ATBPPage(BasePage):
                 if not silent:
                     messagebox.showinfo(
                         "ATBP",
-                        "I couldn't recognize an ATBP results table in this output.\n\n"
-                        "If you send me a real atbp.out snippet, I can harden the parser quickly."
+                        "No recognizable ATBP results table was found in this output file.\n\n"
+                                "Please verify that the ATBP calculation completed successfully "
+                                "and that the selected file corresponds to an ATBP output."
                     )
             else:
                 self.lbl_status.config(text=f"Parsed {len(df)} atoms automatically. Run saved: {self.run_dir.name}")
@@ -11407,8 +14433,9 @@ class ATBPPage(BasePage):
             self.tree.insert("", "end", values=vals)
 
     def refresh_state(self):
+        self._refresh_run_selector()
         self._sync_output_path()
-        ready = self.app.ctx.workspace_ok and self.app.ctx.trho_done and (not self.app._job_running)
+        ready = bool(getattr(self.app.ctx, "workspace_compute_ok", False)) and self.app.ctx.trho_done and (not self.app._job_running)
         try:
             self.btn_run.configure(state=("normal" if ready else "disabled"))
         except Exception:
@@ -11418,7 +14445,7 @@ class ATBPPage(BasePage):
                 self._parse_output(silent=True)
         except Exception:
             pass
-        if self.app._job_running:
+        if self.app._job_running and str(getattr(self.app, "_active_job_kind", "") or "").upper() == "ATBP":
             self._set_running(True, "Running… (ATBP may take a long time)")
         else:
             self._set_running(False)
@@ -11482,6 +14509,23 @@ class BCPEvalPage(BasePage):
         )
         ttk.Label(body, text=msg, justify="left").pack(anchor="w")
 
+        controls_row = ttk.Frame(body)
+        controls_row.pack(anchor="w", pady=(10, 0), fill="x")
+
+        scale_row = ttk.Frame(controls_row)
+        scale_row.pack(side="left", anchor="w")
+        ttk.Label(scale_row, text="Axis scaling:").pack(side="left")
+        self.var_scale_mode = tk.StringVar(value="Threshold-guided")
+        self.cmb_scale_mode = ttk.Combobox(
+            scale_row,
+            textvariable=self.var_scale_mode,
+            state="readonly",
+            width=24,
+            values=("Auto", "Auto + thresholds", "Threshold-guided"),
+        )
+        self.cmb_scale_mode.pack(side="left", padx=(8, 0))
+
+
         btns = ttk.Frame(body)
         btns.pack(anchor="w", pady=(12, 0), fill="x")
         btns.columnconfigure(0, weight=0)
@@ -11522,10 +14566,162 @@ class BCPEvalPage(BasePage):
         self.btn_save_lap_bd.configure(state=("normal" if ok and bool(ctx.workspace_dir) else "disabled"))
         self.btn_save_adim_bd.configure(state=("normal" if ok and bool(ctx.workspace_dir) else "disabled"))
         self.btn_save_adim_lap.configure(state=("normal" if ok and bool(ctx.workspace_dir) else "disabled"))
+        try:
+            self.cmb_scale_mode.configure(state=("readonly" if ok else "disabled"))
+        except Exception:
+            pass
         if ok:
             self.status_var.set(f"BCPs available: {len(parsed.df_bcp_props)}")
         else:
             self.status_var.set("Run TRHO and parse trho.out first.")
+
+    def _descriptor_thresholds(self, key: str) -> tuple[list[float], list[str], bool]:
+        key = str(key or "").strip().upper()
+        if key == "BOND_DEGREE":
+            return [0.0], ["H/ρ = 0"], True
+        if key == "LAP":
+            return [0.0], ["∇²ρ = 0"], True
+        if key == "ADIM_RATIO":
+            return [1.0, 2.0], ["|V|/G = 1", "|V|/G = 2"], False
+        return [], [], False
+
+    def _classify_descriptor_value(self, key: str, value) -> str:
+        try:
+            v = float(value)
+        except Exception:
+            return "—"
+        if not np.isfinite(v):
+            return "—"
+        key = str(key or "").strip().upper()
+        tol = 1e-12
+        if key == "LAP":
+            if abs(v) <= tol:
+                return "Boundary (∇²ρ = 0)"
+            return "Concentration" if v < 0 else "Depletion"
+        if key == "BOND_DEGREE":
+            if abs(v) <= tol:
+                return "Transient"
+            return "Covalent" if v < 0 else "Ionic / vdW"
+        if key == "ADIM_RATIO":
+            if v < 1.0 - tol:
+                return "Covalent"
+            if v > 2.0 + tol:
+                return "Ionic / vdW"
+            return "Transient"
+        return "—"
+
+    def _add_classification_region_labels(self, fig, *, x_key: str, y_key: str, x_range: Optional[list[float]], y_range: Optional[list[float]]):
+
+        return
+
+    def _guided_axis_range(self, series: pd.Series, thresholds: list[float], *, symmetric_zero: bool = False) -> Optional[list[float]]:
+        vals = pd.to_numeric(series, errors="coerce").to_numpy(dtype=float)
+        vals = vals[np.isfinite(vals)]
+        extras = np.asarray(list(thresholds or []), dtype=float)
+        extras = extras[np.isfinite(extras)] if extras.size else extras
+        if vals.size == 0 and extras.size == 0:
+            return None
+        if vals.size:
+            vmin = float(np.min(vals))
+            vmax = float(np.max(vals))
+        else:
+            vmin = vmax = float(extras[0])
+        if extras.size:
+            vmin = min(vmin, float(np.min(extras)))
+            vmax = max(vmax, float(np.max(extras)))
+        if symmetric_zero:
+            lim = max(abs(vmin), abs(vmax), *(abs(float(x)) for x in extras.tolist() if np.isfinite(x)))
+            if lim == 0:
+                lim = 1.0
+            pad = max(0.05 * lim, 0.02)
+            lim += pad
+            return [-lim, lim]
+        span = vmax - vmin
+        if span <= 0:
+            pad = max(0.05 * max(abs(vmin), abs(vmax), 1.0), 0.02)
+        else:
+            pad = max(0.07 * span, 0.02)
+        return [vmin - pad, vmax + pad]
+
+    def _anchor_for_range(self, lo: float, hi: float, axis_min: float, axis_max: float, *, fallback: float = 0.5) -> float:
+        lo_eff = axis_min if not np.isfinite(lo) else max(axis_min, float(lo))
+        hi_eff = axis_max if not np.isfinite(hi) else min(axis_max, float(hi))
+        if hi_eff <= lo_eff:
+            return fallback
+        frac = (0.5 * (lo_eff + hi_eff) - axis_min) / max(axis_max - axis_min, 1e-12)
+        return max(0.06, min(0.94, float(frac)))
+
+    def _apply_bcp_eval_guides(self, fig, df: pd.DataFrame, *, x_key: str, y_key: str):
+        mode = str(getattr(self, "var_scale_mode", tk.StringVar(value="Threshold-guided")).get() or "Threshold-guided").strip().lower()
+        x_thresholds, x_labels, x_sym = self._descriptor_thresholds(x_key)
+        y_thresholds, y_labels, y_sym = self._descriptor_thresholds(y_key)
+        x_range = None
+        y_range = None
+
+        if mode == "threshold-guided":
+            x_range = self._guided_axis_range(df[x_key], x_thresholds, symmetric_zero=x_sym) if x_key in df.columns else None
+            y_range = self._guided_axis_range(df[y_key], y_thresholds, symmetric_zero=y_sym) if y_key in df.columns else None
+            if x_range is not None:
+                fig.update_xaxes(range=x_range)
+            if y_range is not None:
+                fig.update_yaxes(range=y_range)
+        else:
+            try:
+                xr = fig.layout.xaxis.range
+                yr = fig.layout.yaxis.range
+                x_range = [float(xr[0]), float(xr[1])] if xr and len(xr) == 2 else None
+                y_range = [float(yr[0]), float(yr[1])] if yr and len(yr) == 2 else None
+            except Exception:
+                x_range = None
+                y_range = None
+
+        if mode in ("auto + thresholds", "threshold-guided"):
+            guide_color = "rgba(60,60,60,0.85)"
+            ann_bg = "rgba(255,255,255,0.72)"
+            for thr, label in zip(x_thresholds, x_labels):
+                fig.add_vline(x=float(thr), line_width=2, line_dash="dash", line_color=guide_color)
+                fig.add_annotation(
+                    x=float(thr), y=1.0,
+                    xref="x", yref="paper",
+                    text=label,
+                    showarrow=False,
+                    yanchor="bottom",
+                    yshift=8,
+                    font=dict(size=11, color="black"),
+                    bgcolor=ann_bg,
+                    bordercolor="rgba(80,80,80,0.25)",
+                    borderpad=2,
+                )
+            for thr, label in zip(y_thresholds, y_labels):
+                fig.add_hline(y=float(thr), line_width=2, line_dash="dash", line_color=guide_color)
+                fig.add_annotation(
+                    x=1.0, y=float(thr),
+                    xref="paper", yref="y",
+                    text=label,
+                    showarrow=False,
+                    xanchor="left",
+                    xshift=8,
+                    font=dict(size=11, color="black"),
+                    bgcolor=ann_bg,
+                    bordercolor="rgba(80,80,80,0.25)",
+                    borderpad=2,
+                )
+            if x_range is None:
+                try:
+                    xr = fig.layout.xaxis.range
+                    x_range = [float(xr[0]), float(xr[1])] if xr and len(xr) == 2 else None
+                except Exception:
+                    x_range = None
+            if y_range is None:
+                try:
+                    yr = fig.layout.yaxis.range
+                    y_range = [float(yr[0]), float(yr[1])] if yr and len(yr) == 2 else None
+                except Exception:
+                    y_range = None
+            fig.update_layout(margin=dict(t=80, r=90, b=60, l=70))
+        else:
+            fig.update_layout(margin=dict(t=60, r=40, b=60, l=70))
+        return fig
 
     def _build_figs(self):
         ctx = self.app.ctx
@@ -11538,7 +14734,6 @@ class BCPEvalPage(BasePage):
         if "BCP_ELEM" not in df.columns:
             df["BCP_ELEM"] = "BCP"
 
-                # Format numeric descriptors in hover (cleaner, consistent decimals)
         hover = {}
         hover_fmt = {
             "BCP_ID": True,
@@ -11555,34 +14750,51 @@ class BCPEvalPage(BasePage):
             if col in df.columns:
                 hover[col] = fmt
 
+        if "BOND_DEGREE" in df.columns:
+            df["H_RHO_CLASS"] = df["BOND_DEGREE"].apply(lambda v: self._classify_descriptor_value("BOND_DEGREE", v))
+            hover["H/ρ class"] = True
+            df["H/ρ class"] = df.pop("H_RHO_CLASS")
+        if "ADIM_RATIO" in df.columns:
+            df["VG_CLASS"] = df["ADIM_RATIO"].apply(lambda v: self._classify_descriptor_value("ADIM_RATIO", v))
+            hover["|V|/G class"] = True
+            df["|V|/G class"] = df.pop("VG_CLASS")
+        if "LAP" in df.columns:
+            df["LAP_CLASS"] = df["LAP"].apply(lambda v: self._classify_descriptor_value("LAP", v))
+            hover["Laplacian class"] = True
+            df["Laplacian class"] = df.pop("LAP_CLASS")
+
         fig2 = px.scatter(df, x="LAP", y="BOND_DEGREE", color="BCP_ELEM", hover_name="BCP_LABEL", hover_data=hover, title="∇²ρ (a.u.) × H/ρ (a.u.)")
         fig2.update_traces(marker=dict(size=12, line=dict(width=1, color="DarkSlateGrey")))
+        self._apply_bcp_eval_guides(fig2, df, x_key="LAP", y_key="BOND_DEGREE")
 
         fig3 = px.scatter(df, x="ADIM_RATIO", y="BOND_DEGREE", color="BCP_ELEM", hover_name="BCP_LABEL", hover_data=hover, title="|V|/G (a.u.) × H/ρ (a.u.)")
         fig3.update_traces(marker=dict(size=12, line=dict(width=1, color="DarkSlateGrey")))
+        self._apply_bcp_eval_guides(fig3, df, x_key="ADIM_RATIO", y_key="BOND_DEGREE")
 
         fig4 = px.scatter(df, x="ADIM_RATIO", y="LAP", color="BCP_ELEM", hover_name="BCP_LABEL", hover_data=hover, title="|V|/G (a.u.) × ∇²ρ (a.u.)")
         fig4.update_traces(marker=dict(size=12, line=dict(width=1, color="DarkSlateGrey")))
+        self._apply_bcp_eval_guides(fig4, df, x_key="ADIM_RATIO", y_key="LAP")
 
         return fig2, fig3, fig4
+
     def _open_lap_bd(self):
         try:
             fig2, _, _ = self._build_figs()
-            fig2.show()
+            _show_plotly_figure(fig2)
         except Exception as e:
             messagebox.showerror("BCP Evaluation", str(e))
 
     def _open_adim_bd(self):
         try:
             _, fig3, _ = self._build_figs()
-            fig3.show()
+            _show_plotly_figure(fig3)
         except Exception as e:
             messagebox.showerror("BCP Evaluation", str(e))
 
     def _open_adim_lap(self):
         try:
             _, _, fig4 = self._build_figs()
-            fig4.show()
+            _show_plotly_figure(fig4)
         except Exception as e:
             messagebox.showerror("BCP Evaluation", str(e))
 
@@ -11595,7 +14807,7 @@ class BCPEvalPage(BasePage):
             fig2, _, _ = self._build_figs()
             pdir = Path(ctx.workspace_dir) / "bcp_evaluation"
             pdir.mkdir(parents=True, exist_ok=True)
-            fig2.write_html(str(pdir / "BCP_eval_LAP_x_BOND_DEGREE.html"), include_plotlyjs="directory")
+            fig2.write_html(str(pdir / "BCP_eval_LAP_x_BOND_DEGREE.html"), include_plotlyjs=True)
             self.status_var.set("Saved: " + str(pdir / "BCP_eval_LAP_x_BOND_DEGREE.html"))
         except Exception as e:
             messagebox.showerror("BCP Evaluation", f"Failed to save plot: {e}")
@@ -11609,7 +14821,7 @@ class BCPEvalPage(BasePage):
             _, fig3, _ = self._build_figs()
             pdir = Path(ctx.workspace_dir) / "bcp_evaluation"
             pdir.mkdir(parents=True, exist_ok=True)
-            fig3.write_html(str(pdir / "BCP_eval_ADIM_RATIO_x_BOND_DEGREE.html"), include_plotlyjs="directory")
+            fig3.write_html(str(pdir / "BCP_eval_ADIM_RATIO_x_BOND_DEGREE.html"), include_plotlyjs=True)
             self.status_var.set("Saved: " + str(pdir / "BCP_eval_ADIM_RATIO_x_BOND_DEGREE.html"))
         except Exception as e:
             messagebox.showerror("BCP Evaluation", f"Failed to save plot: {e}")
@@ -11623,10 +14835,11 @@ class BCPEvalPage(BasePage):
             _, _, fig4 = self._build_figs()
             pdir = Path(ctx.workspace_dir) / "bcp_evaluation"
             pdir.mkdir(parents=True, exist_ok=True)
-            fig4.write_html(str(pdir / "BCP_eval_ADIM_RATIO_x_LAP.html"), include_plotlyjs="directory")
+            fig4.write_html(str(pdir / "BCP_eval_ADIM_RATIO_x_LAP.html"), include_plotlyjs=True)
             self.status_var.set("Saved: " + str(pdir / "BCP_eval_ADIM_RATIO_x_LAP.html"))
         except Exception as e:
             messagebox.showerror("BCP Evaluation", f"Failed to save plot: {e}")
+
 class ReportsPage(ttk.Frame):
     """Step B: generate reports right after TRHO is available."""
 
@@ -11634,15 +14847,23 @@ class ReportsPage(ttk.Frame):
         super().__init__(parent)
         self.app = app
 
-        ttk.Label(self, text="Reports", font=("TkDefaultFont", 16, "bold")).grid(row=0, column=0, sticky="w")
-        ttk.Separator(self).grid(row=1, column=0, sticky="ew", pady=(10, 14))
-        self.columnconfigure(0, weight=1)
+        ttk.Label(self, text="Reports", font=("TkDefaultFont", 16, "bold")).pack(anchor="w")
+        ttk.Separator(self).pack(fill="x", pady=(10, 14))
+
+        outer, canvas, vbar, content = _make_scrollable_frame(self)
+        outer.pack(fill="both", expand=True)
+        self._scroll_outer = outer
+        self._scroll_canvas = canvas
+        self._scroll_vbar = vbar
+        self._scroll_inner = content
+        self.content = content
+        self.content.columnconfigure(0, weight=1)
 
         self.summary_var = tk.StringVar(value="No report data parsed yet.")
-        ttk.Label(self, textvariable=self.summary_var, wraplength=900).grid(row=2, column=0, sticky="w", pady=(0, 8))
+        ttk.Label(self.content, textvariable=self.summary_var, wraplength=900).grid(row=2, column=0, sticky="w", pady=(0, 8))
 
         self._build_method_and_run_selectors()
-        self.columnconfigure(0, weight=1)
+        self.content.columnconfigure(0, weight=1)
 
         self.topology_title_var = tk.StringVar(value="")
         self.topology_formula_var = tk.StringVar(value="")
@@ -11650,7 +14871,7 @@ class ReportsPage(ttk.Frame):
         self.topology_status_var = tk.StringVar(value="")
         self.topology_note_var = tk.StringVar(value="")
 
-        topo_box = ttk.Frame(self, padding=(12, 10))
+        topo_box = ttk.Frame(self.content, padding=(12, 10))
         topo_box.grid(row=4, column=0, sticky="ew", pady=(2, 16))
         topo_box.columnconfigure(0, weight=1)
 
@@ -11672,7 +14893,7 @@ class ReportsPage(ttk.Frame):
         )
         self.topology_note_label.grid(row=4, column=0, sticky="w", pady=(4, 0))
 
-        btns = ttk.Frame(self)
+        btns = ttk.Frame(self.content)
         btns.grid(row=5, column=0, sticky="w")
         self.btn_export_xlsx = ttk.Button(btns, text="Export Excel report (final_report.xlsx)", command=self.export_xlsx)
         self.btn_export_xlsx.grid(row=0, column=0, sticky="w")
@@ -11683,7 +14904,7 @@ class ReportsPage(ttk.Frame):
         self.btn_open_viewer.grid(row=0, column=2, sticky="w", padx=(8, 0))
 
         self.hint_var = tk.StringVar(value="Use Method + Active run to inspect TRHO or TLAP results.")
-        ttk.Label(self, textvariable=self.hint_var, foreground="#555").grid(row=6, column=0, sticky="w", pady=(12, 0))
+        ttk.Label(self.content, textvariable=self.hint_var, foreground="#555").grid(row=6, column=0, sticky="w", pady=(12, 0))
 
         self.refresh()
 
@@ -11691,7 +14912,8 @@ class ReportsPage(ttk.Frame):
         self.refresh()
 
     def _build_method_and_run_selectors(self):
-        frm = ttk.LabelFrame(self, text="Report source", padding=(12, 6))
+        parent = getattr(self, "content", self)
+        frm = ttk.LabelFrame(parent, text="Report source", padding=(12, 6))
         frm.grid(row=3, column=0, sticky="ew", pady=(0, 10))
         frm.columnconfigure(0, weight=1)
 
@@ -11811,6 +15033,20 @@ class ReportsPage(ttk.Frame):
         nccp = len(parsed.df_cage) if hasattr(parsed, "df_cage") else 0
         ntrue = len(parsed.df_true_atoms) if hasattr(parsed, "df_true_atoms") else 0
         nna_count = int(getattr(parsed, "nna_count", 0) or 0)
+        issue = detect_trho_output_issue(self.app._find_existing_trho_out() or "", parsed) if (ntrue == 0 and nbcp == 0 and nrcp == 0 and nccp == 0) else None
+        if issue is not None:
+            self.summary_var.set("TRHO output issue: " + issue.get("title", issue.get("kind", "empty topology")))
+            self.topology_title_var.set("Primitive-cell Morse balance")
+            self.topology_formula_var.set(f"TRUE atoms - BCPs + RCPs - CCPs = {ntrue} - {nbcp} + {nrcp} - {nccp} = 0.")
+            self.topology_expected_var.set("Expected value for the primitive-cell representation: 0")
+            self.topology_status_var.set("Primitive-cell Morse balance: not evaluated")
+            self.topology_status_label.configure(foreground="#9c1c1c")
+            self.topology_note_var.set(issue.get("message", "No valid TRHO topology was parsed; the apparent zero balance is not a valid Morse-consistency result."))
+            self.btn_export_xlsx.configure(state="disabled")
+            self.btn_export_csv.configure(state="disabled", text="Export CSV")
+            self.btn_open_viewer.configure(state="disabled")
+            return
+
         summary = f"TRHO parsed OK. TRUE atoms: {ntrue} | BCPs: {nbcp} | RCPs: {nrcp} | CCPs: {nccp}"
         if nna_count > 0:
             summary += f" | Possible NNAs: {nna_count}"
@@ -11874,8 +15110,11 @@ class ReportsPage(ttk.Frame):
         try:
             win = getattr(self.app, "_report_viewer_win", None)
             if win is not None and win.winfo_exists():
-                win.lift()
-                win.focus_force()
+                try:
+                    win.deiconify()
+                    win.attributes("-topmost", False)
+                except Exception:
+                    pass
                 try:
                     win.refresh()
                 except Exception:
@@ -11929,7 +15168,7 @@ class ReportsPage(ttk.Frame):
                     _report_display_df(parsed.df_attr).to_excel(writer, sheet_name="attr")
                     _report_display_df(parsed.df_ring).to_excel(writer, sheet_name="rcp")
                     _report_display_df(parsed.df_cage).to_excel(writer, sheet_name="ccp")
-                    _report_display_df(_compact_bcp_dist_headers(parsed.df_bcp_props)).to_excel(writer, sheet_name="BCP_prop")
+                    _report_display_df(_compact_bcp_dist_headers(_reorder_bcp_report_columns(parsed.df_bcp_props))).to_excel(writer, sheet_name="BCP_prop")
                     if parsed.df_rcp_props is not None:
                         _report_display_df(parsed.df_rcp_props).to_excel(writer, sheet_name="RCP_prop")
                     if parsed.df_ccp_props is not None:
@@ -11968,19 +15207,207 @@ class ReportsPage(ttk.Frame):
             out_dir = self._report_output_dir(method)
             out_path = out_dir / "bcp_properties.csv"
             try:
-                _report_display_df(_compact_bcp_dist_headers(parsed.df_bcp_props)).to_csv(out_path, index=False)
+                _report_display_df(_compact_bcp_dist_headers(_reorder_bcp_report_columns(parsed.df_bcp_props))).to_csv(out_path, index=False)
                 messagebox.showinfo("Reports", f"CSV written:\n{out_path}")
                 self.app._job_queue.put(("log", f"[REPORT] wrote {out_path}"))
             except Exception as e:
                 messagebox.showerror("Reports", f"Failed to write CSV: {e}")
 
     def on_show(self):
-        # Called by App.show_page(). We keep it lightweight and just refresh button states.
+
         try:
             self.app.refresh_ui_state()
         except Exception:
             pass
 
 
+try:
+    PL2DPage._create_pl2d_run_dir = _create_pl2d_run_dir
+    PL2DPage._compute_pl2d_zs = _compute_pl2d_zs
+    PL2DPage._pl2d_flags_line = _pl2d_flags_line
+    PL2DPage._write_pl2d_input_for_slice = _write_pl2d_input_for_slice
+    PL2DPage._write_pl2d_unix_scripts = _write_pl2d_unix_scripts
+    PL2DPage._export_pl2d_campaign = _export_pl2d_campaign
+    PL2DPage._run_pl2d = _run_pl2d
+except Exception:
+    pass
+
 if __name__ == "__main__":
     main()
+
+
+def _pl2dpage_run_pl2d_fixed(self):
+    log_event(self.app.ctx, 'PL2D started')
+    self.app.state.pl2d_running = True
+    self.lbl_status.configure(text='⏳ PL2D running…')
+    self.btn_run.configure(state='disabled')
+
+    if not (getattr(self.app.state, "workspace_compute_ok", False) and self.app.state.trho_parsed is not None):
+        self.app.state.pl2d_running = False
+        messagebox.showwarning('PL2D', 'PL2D requires a parsed TRHO result and fort.9 or *.f9/*.9 in the workspace.')
+        return
+    try:
+        cfg = self._build_config()
+    except Exception as e:
+        self.app.state.pl2d_running = False
+        messagebox.showerror('PL2D', f'Invalid configuration: {e}')
+        return
+
+    ctx = self.app.state
+    if not self.app._ensure_properties_executable_ready('PL2D'):
+        self.app.state.pl2d_running = False
+        return
+    prop_exe = getattr(ctx, 'properties_exe', None)
+    exe_path = _best_effort_make_executable(str(prop_exe) if prop_exe is not None else None)
+
+    fort9_src = None
+    if ctx.workspace_dir:
+        cand = ctx.workspace_dir / 'fort.9'
+        if cand.exists():
+            fort9_src = cand
+    if fort9_src is None:
+        self.app.state.pl2d_running = False
+        messagebox.showerror('PL2D', 'fort.9 not found in workspace. Make sure the workspace has fort.9 first.')
+        return
+
+    sig = self._signature(cfg)
+    root = self._runs_root()
+    root.mkdir(parents=True, exist_ok=True)
+    ts, run_dir = self._create_pl2d_run_dir(root, cfg, sig)
+
+    try:
+        f9_stat = fort9_src.stat()
+        f9_fp = {'size': int(f9_stat.st_size), 'mtime': int(f9_stat.st_mtime)}
+    except Exception:
+        f9_fp = {}
+
+    mf = {
+        'signature': sig,
+        'created_at': ts,
+        'config': cfg,
+        'engine': 'properties',
+        'properties_exe': str(exe_path),
+        'project_name': str(cfg.get('project_name', '') or '') if bool(cfg.get('project_name_custom', False)) else '',
+        'source': {'fort9': str(fort9_src), 'fort9_fp': f9_fp},
+        'status': 'running',
+    }
+    (run_dir / 'manifest.json').write_text(json.dumps(mf, indent=2), encoding='utf-8')
+
+    zs = self._compute_pl2d_zs(cfg)
+    out_name = str(cfg.get('project_name') or (ctx.workspace_dir.name if ctx.workspace_dir else 'PL2D'))
+
+    try:
+        self.app.set_task(active=False)
+    except Exception:
+        pass
+
+    ok_all = True
+    try:
+        self.pb.configure(maximum=len(zs), value=0)
+        self.lbl_pb.configure(text=f'Slice 0/{len(zs)}')
+        self.update_idletasks()
+    except Exception:
+        pass
+
+    for i, z in enumerate(zs):
+        sdir = run_dir / f'slice{i:03d}'
+        sdir.mkdir()
+        try:
+            shutil.copy2(fort9_src, sdir / 'fort.9')
+        except Exception as e:
+            ok_all = False
+            self.app._job_queue.put(('log', f'[PL2D] Failed to copy fort.9 to {sdir}: {e}'))
+            break
+
+        try:
+            self._write_pl2d_input_for_slice(sdir, z, cfg, out_name=out_name)
+        except Exception as e:
+            ok_all = False
+            self.app._job_queue.put(('log', f'[PL2D] Failed to write pl2d.inp in {sdir}: {e}'))
+            break
+
+        inp = sdir / 'pl2d.inp'
+        out = sdir / 'pl2d.out'
+        err = sdir / 'pl2d.err'
+        try:
+            with open(inp, 'r', encoding='utf-8', errors='ignore') as fin, \
+                 open(out, 'w', encoding='utf-8') as fout, \
+                 open(err, 'w', encoding='utf-8') as ferr:
+                proc = subprocess.run(
+                    [str(exe_path)],
+                    stdin=fin,
+                    stdout=fout,
+                    stderr=ferr,
+                    cwd=str(sdir),
+                    **_windows_subprocess_silent_kwargs(),
+                )
+            if proc.returncode != 0:
+                ok_all = False
+                self.app._job_queue.put(('log', f'[PL2D] properties returned {proc.returncode} on slice {i:03d}'))
+                try:
+                    if err.exists():
+                        err_txt = err.read_text(errors='ignore')
+                        self.app._job_queue.put(('log', '[PL2D] STDERR:\n' + err_txt[-1000:]))
+                    if out.exists():
+                        out_txt = out.read_text(errors='ignore')
+                        self.app._job_queue.put(('log', '[PL2D] STDOUT tail:\n' + out_txt[-1000:]))
+                except Exception:
+                    pass
+                break
+        except Exception as e:
+            ok_all = False
+            self.app._job_queue.put(('log', f'[PL2D] Failed to run properties on slice {i:03d}: {e}'))
+            try:
+                (sdir / 'pl2d.err').write_text('EXCEPTION\n' + str(e) + '\n\n' + traceback.format_exc(), encoding='utf-8')
+            except Exception:
+                pass
+            break
+
+        for fn in ('fort.3', 'fort.9', 'fort.11', 'fort.13'):
+            try:
+                p = sdir / fn
+                if p.exists():
+                    p.unlink()
+            except Exception:
+                pass
+
+        try:
+            self.pb['value'] = i + 1
+            self.lbl_pb.configure(text=f'Slice {i+1}/{len(zs)}')
+            self.update_idletasks()
+        except Exception:
+            pass
+
+    try:
+        if ok_all:
+            self.pb['value'] = len(zs)
+            self.lbl_pb.configure(text=f'Done ({len(zs)}/{len(zs)})')
+        self.update_idletasks()
+    except Exception:
+        pass
+
+    mf['status'] = 'complete' if ok_all else 'failed'
+    (run_dir / 'manifest.json').write_text(json.dumps(mf, indent=2), encoding='utf-8')
+
+    if not ok_all:
+        log_event(ctx, f'PL2D finished FAIL: {run_dir.name}')
+        self.app.state.pl2d_running = False
+        messagebox.showerror('PL2D', 'PL2D failed. Check slice folders and pl2d.out for details.')
+        self.lbl_status.configure(text='▶ PL2D not run')
+        return
+
+    self.app.state.pl2d_run_dir = run_dir
+    display_name = str(cfg.get('project_name') or '').strip() if bool(cfg.get('project_name_custom', False)) else run_dir.name
+    log_event(ctx, f'PL2D finished OK: {run_dir.name}')
+    self.lbl_status.configure(text='✔ PL2D existing')
+    self.app.set_status(f'PL2D finished: {display_name}')
+    self.app.state.pl2d_running = False
+    self.app.refresh_all_pages()
+
+
+try:
+    PL2DPage._export_pl2d_campaign = _export_pl2d_campaign
+    PL2DPage._run_pl2d = _pl2dpage_run_pl2d_fixed
+except Exception:
+    pass
+

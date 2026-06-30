@@ -4,6 +4,9 @@ Token_Github*
 *.zip
 dist/
 build/
+release/
+*.exe
+*.AppImage
 __pycache__/
 *.pyc
 *.pyo
@@ -11,3 +14,5 @@ venv/
 .venv/
 topsio_env/
 .idea/
+venv_topiso3d_v2026/
+github-recovery-codes.txt

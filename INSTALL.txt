@@ -1,0 +1,51 @@
+TopIso3D v2026
+================
+
+This folder contains the final source code of TopIso3D v2026.
+
+Project structure
+-----------------
+TopIso3D_v2026.py        Main source code
+TopIso3D_v2026.spec      PyInstaller specification
+TopIso3D_installer.iss   Inno Setup script (Windows)
+requirements.txt         Runtime dependencies
+requirements-dev.txt     Development/packaging dependencies
+
+Recreating the environment
+--------------------------
+
+1. Create a virtual environment
+
+   python3 -m venv venv
+
+2. Activate the virtual environment
+
+   Linux/macOS:
+      source venv/bin/activate
+
+   Windows:
+      venv\Scripts\activate
+
+3. Install dependencies
+
+   pip install -r requirements-dev.txt
+
+Packaging
+----------
+
+Windows
+   pyinstaller TopIso3D_v2026.spec
+   Build installer with Inno Setup using TopIso3D_installer.iss
+
+macOS
+   Build with PyInstaller using the .spec file.
+
+Linux
+   Build with PyInstaller using the .spec file.
+   Generate the AppImage from the executable.
+
+Version
+-------
+TopIso3D v2026
+Final official multi-platform release
+(UFPB / Università di Torino collaboration)
