@@ -5,11 +5,11 @@ This folder contains the final source code of TopIso3D v2026.
 
 Project structure
 -----------------
-TopIso3D_v2026.py        Main source code
-TopIso3D_v2026.spec      PyInstaller specification
-TopIso3D_installer.iss   Inno Setup script (Windows)
-requirements.txt         Runtime dependencies
-requirements-dev.txt     Development/packaging dependencies
+TopIso3D_v2026.py              Main source code
+TopIso3D_v2026.spec            PyInstaller specification
+TopIso3D_v2026_installer.iss   Inno Setup script (Windows)
+requirements.txt               Runtime dependencies
+requirements-dev.txt           Development/packaging dependencies
 
 Recreating the environment
 --------------------------
