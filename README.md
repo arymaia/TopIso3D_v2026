@@ -29,9 +29,10 @@ exploration of topological data.
 Complete documentation for TopIso3D v2026 is available in the official
 user manual:
 
-**Ary da Silva Maia. _From Topological Data to Scientific Exploration:
-TopIso3D v2026 User Manual_. 1st ed., 2026.**  
+**From Topological Data to Scientific Exploration: TopIso3D v2026 User Manual**
+Ary da Silva Maia (2026)
 ISBN: 978-65-02-29867-1
+DOI: 10.5281/zenodo.21945798
 
 [Download the TopIso3D v2026 User Manual (PDF)](docs/TopIso3D_v2026_User_Manual.pdf)
 
