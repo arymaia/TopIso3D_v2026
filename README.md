@@ -86,3 +86,7 @@ Universidade Federal do Rio Grande do Norte (UFRN), Brazil
 TopIso3D v2026 was developed within the scientific collaboration between
 the Universidade Federal da Paraíba (Brazil) and the Università degli
 Studi di Torino (Italy).
+
+## License
+
+TopIso3D v2026 is distributed under the MIT License. See the [LICENSE](LICENSE) file for details.
