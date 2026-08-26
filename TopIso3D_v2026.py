@@ -1743,6 +1743,15 @@ def parse_trho_out(
     rab_arr = np.full(cont_bcp, np.nan) if cont_bcp else np.array([])
     bpl_over_rab_arr = np.full(cont_bcp, np.nan) if cont_bcp else np.array([])
 
+    # Bond-path QA / provenance.
+    # PATH_STATUS remains OK unless TOPOND explicitly reports that one of the
+    # path attractors could not be found.  The fallback based on the local
+    # cluster is intentionally preserved; the warning records the TOPOND event
+    # without invalidating the atom assignment recovered by TopIso3D.
+    path_status = np.full(cont_bcp, "OK", dtype="U12") if cont_bcp else np.array([], dtype="U12")
+    topond_path_warning = np.full(cont_bcp, "", dtype="U96") if cont_bcp else np.array([], dtype="U96")
+    rab_source = np.full(cont_bcp, "", dtype="U16") if cont_bcp else np.array([], dtype="U16")
+
 
     topond_bcp_cp_n = np.full(cont_bcp, np.nan) if cont_bcp else np.array([])
 
@@ -1808,34 +1817,168 @@ def parse_trho_out(
         }
         return periodic.get(z, f"Z{z}")
 
-    def _cp_number_before(line_index: int):
-        """Return the original TOPOND CP N. immediately preceding a CP TYPE line."""
+    # ------------------------------------------------------------------
+    # Structural boundaries for verbose TOPOND CP analysis blocks
+    # ------------------------------------------------------------------
+    # Important TOPOND detail:
+    #   "CP N. <n>" is used both for a new main critical-point block and for
+    #   numbered attractor records printed while a BCP bond path is being
+    #   analysed.  Therefore CP N. alone is NOT sufficient to close a BCP.
+    #
+    # A new main CP starts only when the first semantic line after "CP N." and
+    # its asterisk separator is "CP TYPE ...".  If that line is
+    # "ATTRACTOR CP TYPE ...", the record belongs to the bond-path analysis of
+    # the current BCP and must remain inside the same parsing block.
+    _cp_record_re = re.compile(r"^\s*CP\s+N\.\s*(\d+)\s*$", re.IGNORECASE)
+
+    _cp_records: list[tuple[int, int]] = []
+    for _idx, _line in enumerate(txt):
+        _m = _cp_record_re.match(_line)
+        if _m:
+            _cp_records.append((_idx, int(_m.group(1))))
+
+    def _first_semantic_line_after_cp_n(cp_n_index: int) -> tuple[int | None, str]:
+        """Return the first non-empty, non-asterisk line after an exact CP N. record."""
+        jj = int(cp_n_index) + 1
+        while jj < len(txt):
+            s = txt[jj].strip()
+            if not s:
+                jj += 1
+                continue
+            if s and set(s) <= {"*"}:
+                jj += 1
+                continue
+            return jj, s
+        return None, ""
+
+    _main_cp_starts: list[tuple[int, int]] = []
+    for _idx, _cp_number in _cp_records:
+        _semantic_idx, _semantic = _first_semantic_line_after_cp_n(_idx)
+        _up = _semantic.upper()
+        if _up.startswith("CP TYPE"):
+            _main_cp_starts.append((_idx, _cp_number))
+
+    _main_cp_positions = [p for p, _n in _main_cp_starts]
+
+    _main_cp_final_end = len(txt)
+    if _main_cp_starts:
+        for _idx in range(_main_cp_starts[-1][0] + 1, len(txt)):
+            if "NUMBER OF ATOM PAIRS INVESTIGATED" in txt[_idx].upper():
+                _main_cp_final_end = _idx
+                break
+
+    def _main_cp_bounds_for_line(line_index: int) -> tuple[int, int, int | None]:
+        """Return (start, end, CP number) for the main CP block containing line_index.
+
+        The end is the next CP N. that actually starts a new main "CP TYPE"
+        block.  Numbered "ATTRACTOR CP TYPE" records do not terminate a BCP.
+        """
         try:
-            for jj in range(int(line_index), max(-1, int(line_index) - 12), -1):
-                m = re.search(r"CP\s+N\.\s*(\d+)", txt[jj], re.IGNORECASE)
-                if m:
-                    return int(m.group(1))
+            import bisect as _bisect
+            pos = int(line_index)
+            k = _bisect.bisect_right(_main_cp_positions, pos) - 1
+            if k < 0:
+                return (0, len(txt), None)
+
+            cp_start, cp_number = _main_cp_starts[k]
+            if k + 1 < len(_main_cp_starts):
+                cp_end = _main_cp_starts[k + 1][0]
+            else:
+                cp_end = _main_cp_final_end
+
+            if cp_end <= cp_start:
+                cp_end = len(txt)
+            return (cp_start, cp_end, cp_number)
         except Exception:
-            pass
-        return np.nan
+            return (0, len(txt), None)
 
-    def _cp_cluster_after(line_index: int, *, max_scan: int = 120, max_shown: int = 6) -> dict:
-        """Parse TOPOND's local "CLUSTER OF ATOMS AROUND THE CP" after a CP block.
+    def _cp_number_before(line_index: int):
+        """Return the main TOPOND CP N. associated with a CP TYPE line."""
+        _start, _end, cp_number = _main_cp_bounds_for_line(line_index)
+        return cp_number if cp_number is not None else np.nan
 
-        The number of atoms printed in this section depends on the TOPOND input.
-        TopIso3D therefore preserves the full list for exports and creates a compact
-        display list (up to max_shown atoms plus "...") for GUI tables.
+    def _cp_cluster_records_after(line_index: int) -> List[dict]:
+        """Return atom records from TOPOND's local CLUSTER OF ATOMS AROUND THE CP.
+
+        Each record retains the atom identity, periodic-image coordinates printed
+        by TOPOND (AU), the corresponding coordinates in Å, and the CP-to-atom
+        distance printed in the cluster.  Keeping the periodic-image coordinates
+        is important when a geometric RAB must be reconstructed.
+        """
+        records: List[dict] = []
+        try:
+            _cp_start, search_end, _cp_number = _main_cp_bounds_for_line(line_index)
+            kk = int(line_index) + 1
+            while kk < search_end and "CLUSTER OF ATOMS AROUND THE CP" not in txt[kk]:
+                kk += 1
+
+            if kk >= search_end:
+                return records
+
+            ll = kk + 1
+            while ll < search_end:
+                line = txt[ll]
+                parts = line.split()
+
+                if len(parts) >= 10 and parts[0].isdigit() and parts[1].isdigit() and parts[5].isdigit():
+                    try:
+                        old_id = int(parts[1])
+                        znum = int(parts[5])
+                        x_au = float(parts[6])
+                        y_au = float(parts[7])
+                        z_au = float(parts[8])
+                        dist_ang = float(parts[-1])
+                        symbol = atom_symbol(znum)
+                        records.append({
+                            "atom": f"{symbol}-{old_id}",
+                            "symbol": symbol,
+                            "old_id": old_id,
+                            "znum": znum,
+                            "x_au": x_au,
+                            "y_au": y_au,
+                            "z_au": z_au,
+                            "x_ang": x_au * bohr_to_ang,
+                            "y_ang": y_au * bohr_to_ang,
+                            "z_ang": z_au * bohr_to_ang,
+                            "dist_ang": dist_ang,
+                        })
+                    except Exception:
+                        pass
+                elif records:
+                    if (not line.strip()) or line.strip().startswith("********"):
+                        break
+                ll += 1
+        except Exception:
+            return []
+        return records
+
+    def _cluster_record_for_atom(records: List[dict], atom_label: str) -> Optional[dict]:
+        """Return the local periodic image matching atom_label and closest to the CP."""
+        label = str(atom_label or "").strip()
+        if not label:
+            return None
+        candidates = [r for r in records if str(r.get("atom", "")).strip() == label]
+        if not candidates:
+            return None
+        try:
+            return min(candidates, key=lambda r: float(r.get("dist_ang", np.inf)))
+        except Exception:
+            return candidates[0]
+
+    def _cp_cluster_after(line_index: int, *, max_shown: int = 6) -> dict:
+        """Parse TOPOND's local "CLUSTER OF ATOMS AROUND THE CP".
+
+        The scan is limited by the next main CP block rather than by a fixed
+        number of lines.
         """
         atoms: List[str] = []
         distances: List[float] = []
         try:
-            search_end = min(int(line_index) + int(max_scan), len(txt))
+            _cp_start, search_end, _cp_number = _main_cp_bounds_for_line(line_index)
             kk = int(line_index) + 1
             while kk < search_end and "CLUSTER OF ATOMS AROUND THE CP" not in txt[kk]:
-
-                if kk > int(line_index) + 3 and "CP TYPE" in txt[kk].upper():
-                    break
                 kk += 1
+
             if kk >= search_end or "CLUSTER OF ATOMS AROUND THE CP" not in txt[kk]:
                 return {"full": "", "shown": "", "distances": "", "n": 0}
 
@@ -1843,7 +1986,6 @@ def parse_trho_out(
             while ll < search_end:
                 line = txt[ll]
                 parts = line.split()
-
 
                 if len(parts) >= 10 and parts[0].isdigit() and parts[1].isdigit() and parts[5].isdigit():
                     try:
@@ -1854,8 +1996,7 @@ def parse_trho_out(
                     except Exception:
                         pass
                 elif atoms:
-
-                    if (not line.strip()) or line.strip().startswith("CP N.") or line.strip().startswith("********") or "CP TYPE" in line.upper():
+                    if (not line.strip()) or line.strip().startswith("********"):
                         break
                 ll += 1
 
@@ -1932,8 +2073,37 @@ def parse_trho_out(
                     j += 1
 
 
+                _cp_start, cp_end, _cp_number = _main_cp_bounds_for_line(i)
+
+                # Preserve TOPOND path-tracing warnings with attractor identity.
+                # This is informational: it does NOT disable the historical
+                # CLUSTER OF ATOMS AROUND THE CP fallback.
+                _warning_ids = []
+                _warning_re = re.compile(
+                    r"THE\s+CODE\s+WAS\s+UNABLE\s+TO\s+FIND\s+THE\s+PATH\s+ATTRACTOR\s*([12])?",
+                    re.IGNORECASE,
+                )
+                for _mm in range(i, cp_end):
+                    _wm = _warning_re.search(txt[_mm])
+                    if _wm:
+                        _wid = (_wm.group(1) or "").strip()
+                        if _wid and _wid not in _warning_ids:
+                            _warning_ids.append(_wid)
+                        elif not _wid and "?" not in _warning_ids:
+                            _warning_ids.append("?")
+
+                if _warning_ids:
+                    path_status[b] = "WARNING"
+                    _warning_tokens = []
+                    for _wid in _warning_ids:
+                        if _wid in ("1", "2"):
+                            _warning_tokens.append(f"PATH_ATTRACTOR_{_wid}_NOT_FOUND")
+                        else:
+                            _warning_tokens.append("PATH_ATTRACTOR_NOT_FOUND")
+                    topond_path_warning[b] = ";".join(_warning_tokens)
+
                 eig_set = False
-                for jj in range(j, min(j + 20, len(txt))):
+                for jj in range(j, min(j + 20, cp_end)):
                     fl = _floats(txt[jj])
                     if len(fl) >= 3 and ("EIGEN" in txt[jj].upper() or "L1" in txt[jj] or "L2" in txt[jj]):
                         vals3 = _last_n(fl, 3)
@@ -1944,7 +2114,7 @@ def parse_trho_out(
                             break
                 if not eig_set:
 
-                    for jj in range(j, min(j + 25, len(txt))):
+                    for jj in range(j, min(j + 25, cp_end)):
                         vals3 = _last_n(_floats(txt[jj]), 3)
                         if len(vals3) == 3:
                             eig[b, 0], eig[b, 1], eig[b, 2] = vals3
@@ -1952,7 +2122,7 @@ def parse_trho_out(
                             break
 
 
-                for jj in range(j, min(j + 25, len(txt))):
+                for jj in range(j, min(j + 25, cp_end)):
                     if "ELLIP" in txt[jj].upper() or "ELLIPT" in txt[jj].upper():
                         vals1 = _last_n(_floats(txt[jj]), 1)
                         if len(vals1) == 1:
@@ -1966,7 +2136,7 @@ def parse_trho_out(
 
 
                 try:
-                    search_end = min(i + 240, len(txt))
+                    search_end = cp_end
                     kk = i + 1
                     while kk < search_end and "SEARCH OF BOND PATH ATTRACTORS" not in txt[kk]:
                         kk += 1
@@ -1977,7 +2147,7 @@ def parse_trho_out(
                         while ll < search_end and len(attr_info) < 2:
                             line_up = txt[ll].upper().replace(" ", "")
                             if "ATTRACTORCPTYPE" in line_up and "(3,-3)" in line_up:
-                                coords_au = _last_n(_floats(txt[ll + 1] if ll + 1 < len(txt) else ""), 3)
+                                coords_au = _last_n(_floats(txt[ll + 1] if ll + 1 < search_end else ""), 3)
                                 traj_len = np.nan
                                 term_atom = None
                                 term_atom_id = np.nan
@@ -2043,44 +2213,70 @@ def parse_trho_out(
                                 vals3 = _last_n(_floats(txt[mm]), 3)
                                 if len(vals3) == 3:
                                     bpl_arr[b], rab_arr[b], bpl_over_rab_arr[b] = vals3
+                                    if np.isfinite(rab_arr[b]):
+                                        rab_source[b] = "TOPOND"
                                 break
 
 
+                    # Historical fallback: if one or both atom identities could
+                    # not be obtained from the path-terminus blocks, recover them
+                    # from the two closest distinct atoms in the LOCAL CP cluster.
+                    # The structural CP boundary guarantees that this fallback
+                    # cannot consume information from the following critical point.
+                    _local_cluster_records = _cp_cluster_records_after(i)
+
                     if not neigh1[b] or not neigh2[b]:
                         found_neighbors = []
-                        kk = i + 1
-                        while kk < search_end and "CLUSTER OF ATOMS AROUND THE CP" not in txt[kk]:
-                            kk += 1
-                        if kk < search_end:
-                            seen = set()
-                            ll = kk + 1
-                            while ll < search_end and len(found_neighbors) < 2:
-                                line = txt[ll]
-                                parts = line.split()
+                        seen = set()
+                        for _rec in sorted(
+                            _local_cluster_records,
+                            key=lambda r: float(r.get("dist_ang", np.inf)),
+                        ):
+                            _key = (_rec.get("old_id"), _rec.get("znum"))
+                            if _key in seen:
+                                continue
+                            seen.add(_key)
+                            found_neighbors.append(_rec)
+                            if len(found_neighbors) >= 2:
+                                break
 
-
-                                if len(parts) >= 10 and parts[0].isdigit() and parts[1].isdigit() and parts[5].isdigit():
-                                    try:
-                                        old_id = int(parts[1])
-                                        znum = int(parts[5])
-                                        dist = float(parts[-1])
-                                        key = (old_id, znum)
-                                        if key not in seen:
-                                            seen.add(key)
-                                            found_neighbors.append((dist, atom_symbol(znum), old_id))
-                                    except Exception:
-                                        pass
-                                elif found_neighbors and ("CP TYPE" in line or "ATTRACTOR CP TYPE" in line or not line.strip()):
-                                    break
-                                ll += 1
-
-                        found_neighbors.sort(key=lambda t: t[0])
                         if len(found_neighbors) >= 1 and not neigh1[b]:
-                            neigh1[b] = f"{found_neighbors[0][1]}-{found_neighbors[0][2]}"
-                            dist1[b] = found_neighbors[0][0]
+                            _rec = found_neighbors[0]
+                            neigh1[b] = str(_rec.get("atom", ""))
+                            dist1[b] = float(_rec.get("dist_ang", np.nan))
                         if len(found_neighbors) >= 2 and not neigh2[b]:
-                            neigh2[b] = f"{found_neighbors[1][1]}-{found_neighbors[1][2]}"
-                            dist2[b] = found_neighbors[1][0]
+                            _rec = found_neighbors[1]
+                            neigh2[b] = str(_rec.get("atom", ""))
+                            dist2[b] = float(_rec.get("dist_ang", np.nan))
+
+                    # RAB is a direct internuclear distance and does not require a
+                    # completed bond-path tracing.  When TOPOND does not print RAB
+                    # but TopIso3D has identified both atoms, reconstruct RAB from
+                    # the periodic-image coordinates printed in the local CP cluster.
+                    #
+                    # BPL and BPL/RAB intentionally remain NaN when TOPOND did not
+                    # complete/provide the bond path.
+                    if (not np.isfinite(rab_arr[b])) and neigh1[b] and neigh2[b]:
+                        _rec1 = _cluster_record_for_atom(_local_cluster_records, neigh1[b])
+                        _rec2 = _cluster_record_for_atom(_local_cluster_records, neigh2[b])
+                        if _rec1 is not None and _rec2 is not None:
+                            try:
+                                _p1 = np.array([
+                                    float(_rec1["x_au"]),
+                                    float(_rec1["y_au"]),
+                                    float(_rec1["z_au"]),
+                                ], dtype=float)
+                                _p2 = np.array([
+                                    float(_rec2["x_au"]),
+                                    float(_rec2["y_au"]),
+                                    float(_rec2["z_au"]),
+                                ], dtype=float)
+                                _rab_geom = float(np.linalg.norm(_p1 - _p2) * bohr_to_ang)
+                                if np.isfinite(_rab_geom):
+                                    rab_arr[b] = _rab_geom
+                                    rab_source[b] = "GEOMETRIC"
+                            except Exception:
+                                pass
                 except Exception:
                     pass
 
@@ -2313,6 +2509,9 @@ def parse_trho_out(
         "BPL_ANG": bpl_arr,
         "RAB_ANG": rab_arr,
         "BPL_OVER_RAB": bpl_over_rab_arr,
+        "PATH_STATUS": path_status,
+        "TOPOND_PATH_WARNING": topond_path_warning,
+        "RAB_SOURCE": rab_source,
         "RHO": rho,
         "GRHO": grho,
         "GKIN": gkin,
@@ -7676,8 +7875,17 @@ def _reorder_bcp_report_columns(df: Optional[pd.DataFrame]) -> pd.DataFrame:
         return out
 
     first = [c for c in ("N", "TOPOND_CP_N") if c in out.columns]
-    rest = [c for c in out.columns if c not in first]
-    return out.loc[:, first + rest]
+
+    identification = [
+        c for c in (
+            "BCP_ELEM", "ELEM1", "DIST_ELEM1_ANG", "ELEM2", "DIST_ELEM2_ANG",
+            "BPL_ANG", "RAB_ANG", "BPL_OVER_RAB",
+            "PATH_STATUS", "TOPOND_PATH_WARNING", "RAB_SOURCE",
+        )
+        if c in out.columns and c not in first
+    ]
+    rest = [c for c in out.columns if c not in first and c not in identification]
+    return out.loc[:, first + identification + rest]
 
 def _report_display_df(df: Optional[pd.DataFrame]) -> pd.DataFrame:
     """Return a copy suitable for GUI/exports, keeping geometry only in Å.
@@ -13370,6 +13578,9 @@ class DataFrameTable(ttk.Frame):
             "VIRIAL": "V",
             "ADIM_RATIO": "|V|/G",
             "BOND_DEGREE": "H/ρ",
+            "PATH_STATUS": "PATH STATUS",
+            "TOPOND_PATH_WARNING": "TOPOND WARNING",
+            "RAB_SOURCE": "RAB SOURCE",
         }
         return aliases.get(name, name)
 
@@ -13399,6 +13610,9 @@ class DataFrameTable(ttk.Frame):
             "BPL_ANG": "Bond-path length (Å): sum of the two BCP-to-attractor path lengths.",
             "RAB_ANG": "Direct internuclear distance between the two connected atoms (Å).",
             "BPL_OVER_RAB": "Bond-path curvature indicator. Values close to 1 indicate an almost straight bond path.",
+            "PATH_STATUS": "OK when TOPOND reports no path-attractor search failure for this BCP; WARNING when TOPOND explicitly reports that path attractor 1 or 2 could not be found.",
+            "TOPOND_PATH_WARNING": "Detailed TOPOND path-attractor warning. Exported values distinguish PATH_ATTRACTOR_1_NOT_FOUND and PATH_ATTRACTOR_2_NOT_FOUND.",
+            "RAB_SOURCE": "Origin of RAB_ANG: TOPOND when read directly from the TOPOND BPL/RAB line; GEOMETRIC when reconstructed by TopIso3D from the identified atoms in the local CP cluster.",
             "ATTR1_TRAJ_LEN_ANG": "Trajectory length from the BCP to attractor 1 along the bond path (Å).",
             "ATTR2_TRAJ_LEN_ANG": "Trajectory length from the BCP to attractor 2 along the bond path (Å).",
 
@@ -13812,8 +14026,18 @@ class ReportViewerWindow(tk.Toplevel):
         def _reorder_bcp_columns(df: pd.DataFrame) -> pd.DataFrame:
             if df is None or df.empty:
                 return df
-            hidden_in_report = {"ATTR1_ATOM_ID", "ATTR2_ATOM_ID", "ATTR1_TRAJ_LEN_ANG", "ATTR2_TRAJ_LEN_ANG", "ATTR1_X_ANGSTROM", "ATTR1_Y_ANGSTROM", "ATTR1_Z_ANGSTROM", "ATTR2_X_ANGSTROM", "ATTR2_Y_ANGSTROM", "ATTR2_Z_ANGSTROM"}
-            preferred = ["N", "TOPOND_CP_N", "BCP_ELEM", "ELEM1", "DIST_ELEM1_ANG", "ELEM2", "DIST_ELEM2_ANG"]
+            hidden_in_report = {
+                "ATTR1_ATOM_ID", "ATTR2_ATOM_ID",
+                "ATTR1_TRAJ_LEN_ANG", "ATTR2_TRAJ_LEN_ANG",
+                "ATTR1_X_ANGSTROM", "ATTR1_Y_ANGSTROM", "ATTR1_Z_ANGSTROM",
+                "ATTR2_X_ANGSTROM", "ATTR2_Y_ANGSTROM", "ATTR2_Z_ANGSTROM",
+                "TOPOND_PATH_WARNING", "RAB_SOURCE",
+            }
+            preferred = [
+                "N", "TOPOND_CP_N", "BCP_ELEM",
+                "ELEM1", "DIST_ELEM1_ANG", "ELEM2", "DIST_ELEM2_ANG",
+                "BPL_ANG", "RAB_ANG", "BPL_OVER_RAB", "PATH_STATUS",
+            ]
             visible_cols = [c for c in df.columns if c not in hidden_in_report]
             cols = [c for c in preferred if c in visible_cols] + [c for c in visible_cols if c not in preferred]
             return _compact_bcp_dist_headers(_reorder_bcp_report_columns(df.loc[:, cols].copy()))
