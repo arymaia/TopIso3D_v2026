@@ -3837,7 +3837,7 @@ class App(tk.Tk):
             _ensure_floating_window(self._task_win)
             self._task_win.title("Task Details")
             apply_topiso3d_window_icon(self._task_win)
-            self._task_win.geometry("560x360")
+            self._task_win.geometry("560x320")
             self._task_win.protocol("WM_DELETE_WINDOW", self._task_win.withdraw)
 
             frm = ttk.Frame(self._task_win, padding=12)
@@ -3846,13 +3846,6 @@ class App(tk.Tk):
             ttk.Label(frm, text="Current task", font=("TkDefaultFont", 12, "bold")).pack(anchor="w")
             self._task_details_label = ttk.Label(frm, text="—", wraplength=520)
             self._task_details_label.pack(anchor="w", pady=(6, 10))
-
-            self._task_details_progress = ttk.Progressbar(frm, mode="determinate", maximum=100, value=0)
-            self._task_details_progress.pack(fill="x")
-
-            self._task_details_counts = ttk.Label(frm, text="—")
-            self._task_details_counts.pack(anchor="w", pady=(8, 6))
-
 
             self._exec_meta_label = ttk.Label(frm, text="—", wraplength=520, style="Muted.TLabel")
             self._exec_meta_label.pack(anchor="w", pady=(0, 10))
@@ -3903,14 +3896,6 @@ class App(tk.Tk):
             pass
         d = getattr(self, "_task_details", {"text": "", "done": 0, "total": 0})
         self._task_details_label.config(text=d.get("text") or "—")
-        done = int(d.get("done", 0))
-        total = int(d.get("total", 0))
-        if total > 0:
-            self._task_details_progress.config(maximum=total, value=max(0, min(done, total)))
-            self._task_details_counts.config(text=f"{done} / {total}")
-        else:
-            self._task_details_progress.config(maximum=100, value=0)
-            self._task_details_counts.config(text="—")
 
     def _register_active_process(self, proc, job_kind: str) -> None:
         self._active_process = proc
@@ -4690,14 +4675,20 @@ class App(tk.Tk):
         options: Dict[str, Path] = {}
         active_label = "—"
         for rd, lbl in raw_labels:
-            display = f"{lbl} [{rd.name}]" if counts.get(lbl, 0) > 1 else lbl
+            base_display = f"{lbl} [{rd.name}]" if counts.get(lbl, 0) > 1 else lbl
+
+            is_active = False
+            try:
+                is_active = active is not None and Path(active).resolve() == rd.resolve()
+            except Exception:
+                is_active = False
+
+            display = f"✓ {base_display}" if is_active else base_display
             values.append(display)
             options[display] = rd
-            try:
-                if active is not None and Path(active).resolve() == rd.resolve():
-                    active_label = display
-            except Exception:
-                pass
+
+            if is_active:
+                active_label = display
 
         if values and active_label == "—":
             active_label = values[0]
@@ -4870,14 +4861,21 @@ class App(tk.Tk):
         options: Dict[str, Path] = {}
         active_label = "—"
         for rd, lbl in raw_labels:
-            display = f"{lbl} [{rd.name}]" if counts.get(lbl, 0) > 1 else lbl
+            base_display = f"{lbl} [{rd.name}]" if counts.get(lbl, 0) > 1 else lbl
+
+            is_active = False
+            try:
+                is_active = active is not None and Path(active).resolve() == rd.resolve()
+            except Exception:
+                is_active = False
+
+            display = f"✓ {base_display}" if is_active else base_display
             values.append(display)
             options[display] = rd
-            try:
-                if active is not None and Path(active).resolve() == rd.resolve():
-                    active_label = display
-            except Exception:
-                pass
+
+            if is_active:
+                active_label = display
+
         if values and active_label == "—":
             active_label = values[0]
         return values, options, active_label
@@ -5992,15 +5990,174 @@ class App(tk.Tk):
         self.after(100, self._poll_job_queue)
 
     def _help(self):
-        messagebox.showinfo(
-            "Help",
-            "Workflow:\n"
-            "1) Choose a workspace folder\n"
-            "2) The workspace is automatically validated\n"
-            "3) Run TRHO (or another TOPOND module)\n\n"
-            "fort.9 is created automatically only when a TOPOND calculation starts (if needed).\n\n"
-            "For macOS diagnostics, use Help > System Diagnostics to collect information about the runtime environment."
-        )
+        """Open the TopIso3D documentation and support hub."""
+        win = tk.Toplevel(self)
+        _ensure_floating_window(win)
+        win.title("Help")
+        apply_topiso3d_window_icon(win)
+        win.geometry("720x430")
+        win.minsize(660, 390)
+        win.resizable(True, False)
+        try:
+            win.transient(self)
+        except Exception:
+            pass
+
+        body = ttk.Frame(win, padding=18)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=1)
+
+        ttk.Label(
+            body,
+            text="TopIso3D v2026 — Documentation and Support",
+            font=("TkDefaultFont", 13, "bold"),
+        ).grid(row=0, column=0, sticky="w", pady=(0, 12))
+
+        ttk.Label(
+            body,
+            text=(
+                "For instructions, examples, downloads, source code, and the permanent "
+                "publication record, use the official TopIso3D resources below."
+            ),
+            wraplength=660,
+            justify="left",
+        ).grid(row=1, column=0, sticky="w", pady=(0, 16))
+
+        manual_box = ttk.LabelFrame(body, text="User Manual", padding=12)
+        manual_box.grid(row=2, column=0, sticky="ew", pady=(0, 14))
+        manual_box.columnconfigure(0, weight=1)
+
+        ttk.Label(
+            manual_box,
+            text="From Topological Data to Scientific Exploration",
+            font=("TkDefaultFont", 11, "bold"),
+        ).grid(row=0, column=0, sticky="w")
+
+        ttk.Label(
+            manual_box,
+            text="TopIso3D v2026 User Manual",
+            style="Muted.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(2, 8))
+
+        ttk.Label(
+            manual_box,
+            text="The complete manual is included with the TopIso3D distribution and can be opened offline.",
+            wraplength=620,
+            justify="left",
+        ).grid(row=2, column=0, sticky="w", pady=(0, 10))
+
+        def _open_url(url: str) -> None:
+            try:
+                if not webbrowser.open_new_tab(url):
+                    raise RuntimeError("The default browser did not accept the request.")
+            except Exception as e:
+                messagebox.showerror(
+                    "Help",
+                    f"Could not open the requested resource.\n\n{url}\n\nDetails: {e}",
+                    parent=win,
+                )
+
+        def _find_local_manual() -> Optional[Path]:
+            candidates = []
+            for base in (
+                get_runtime_base_dir(),
+                Path(__file__).resolve().parent,
+                Path.cwd(),
+            ):
+                try:
+                    p = Path(base).expanduser().resolve() / "docs" / "TopIso3D_v2026_User_Manual.pdf"
+                    if p not in candidates:
+                        candidates.append(p)
+                except Exception:
+                    pass
+            for p in candidates:
+                try:
+                    if p.exists() and p.is_file():
+                        return p
+                except Exception:
+                    pass
+            return None
+
+        def _open_manual() -> None:
+            manual = _find_local_manual()
+            if manual is None:
+                messagebox.showwarning(
+                    "User Manual",
+                    "The local User Manual could not be found in the TopIso3D distribution.\n\n"
+                    "You can open the published manual from the Zenodo Record button.",
+                    parent=win,
+                )
+                return
+            try:
+                if is_windows():
+                    os.startfile(str(manual))
+                    return
+                if is_macos():
+                    subprocess.Popen(["open", str(manual)])
+                    return
+                subprocess.Popen(["xdg-open", str(manual)])
+            except Exception:
+                try:
+                    if webbrowser.open_new_tab(manual.resolve().as_uri()):
+                        return
+                except Exception:
+                    pass
+                messagebox.showerror(
+                    "User Manual",
+                    f"Could not open the local User Manual.\n\nFile:\n{manual}",
+                    parent=win,
+                )
+
+        ttk.Button(
+            manual_box,
+            text="Open User Manual",
+            command=_open_manual,
+        ).grid(row=3, column=0, sticky="w")
+
+        resources = ttk.LabelFrame(body, text="Online resources", padding=12)
+        resources.grid(row=3, column=0, sticky="ew", pady=(0, 14))
+        resources.columnconfigure(0, weight=1)
+        resources.columnconfigure(1, weight=1)
+
+        ttk.Button(
+            resources,
+            text="TopIso3D Website",
+            command=lambda: _open_url("https://topiso3d.ufpb.com"),
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 6), pady=(0, 8))
+
+        ttk.Button(
+            resources,
+            text="GitHub Repository",
+            command=lambda: _open_url("https://github.com/arymaia/TopIso3D_v2026"),
+        ).grid(row=0, column=1, sticky="ew", padx=(6, 0), pady=(0, 8))
+
+        ttk.Button(
+            resources,
+            text="Zenodo Record",
+            command=lambda: _open_url("https://doi.org/10.5281/zenodo.21945798"),
+        ).grid(row=1, column=0, sticky="ew", padx=(0, 6))
+
+        ttk.Button(
+            resources,
+            text="Close",
+            command=win.destroy,
+        ).grid(row=1, column=1, sticky="ew", padx=(6, 0))
+
+        ttk.Label(
+            body,
+            text="Technical runtime information remains available from Help > System diagnostics…",
+            style="Muted.TLabel",
+            wraplength=660,
+            justify="left",
+        ).grid(row=4, column=0, sticky="w")
+
+        try:
+            win.update_idletasks()
+            px = self.winfo_rootx() + max(0, (self.winfo_width() - win.winfo_width()) // 2)
+            py = self.winfo_rooty() + max(0, (self.winfo_height() - win.winfo_height()) // 2)
+            win.geometry(f"+{px}+{py}")
+        except Exception:
+            pass
 
     def _show_system_diagnostics(self):
         diag_txt = format_system_diagnostics(collect_system_diagnostics(self))
@@ -6075,15 +6232,107 @@ class App(tk.Tk):
         SettingsDialog(self)
 
     def _about(self):
-        messagebox.showinfo("About",
-                    "TopIso3D v2026\n\n"
-                    "Graphical environment for visualization and analysis of "
-                    "TOPOND QTAIM calculations.\n\n"
-                    "Developed by Ary da Silva Maia\n"
-                    "Federal University of Paraíba (UFPB), Brazil\n\n"
-                    "Multiplatform edition (Windows, Linux and macOS)"
-                    "https://topiso3d.ufpb.com"
-                    )
+        """Show TopIso3D software identity and project information."""
+        win = tk.Toplevel(self)
+        _ensure_floating_window(win)
+        win.title("About TopIso3D")
+        apply_topiso3d_window_icon(win)
+        win.geometry("660x420")
+        win.minsize(620, 390)
+        win.resizable(True, False)
+        try:
+            win.transient(self)
+        except Exception:
+            pass
+
+        body = ttk.Frame(win, padding=18)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=1)
+
+        ttk.Label(
+            body,
+            text="TopIso3D v2026",
+            font=("TkDefaultFont", 15, "bold"),
+        ).grid(row=0, column=0, sticky="w", pady=(0, 6))
+
+        ttk.Label(
+            body,
+            text="Cross-platform environment for topological analysis of periodic electronic-structure calculations.",
+            wraplength=600,
+            justify="left",
+        ).grid(row=1, column=0, sticky="w", pady=(0, 16))
+
+        dev_box = ttk.LabelFrame(body, text="Developed by", padding=12)
+        dev_box.grid(row=2, column=0, sticky="ew", pady=(0, 14))
+        dev_box.columnconfigure(0, weight=1)
+
+        ttk.Label(
+            dev_box,
+            text="Ary da Silva Maia",
+            font=("TkDefaultFont", 11, "bold"),
+        ).grid(row=0, column=0, sticky="w")
+
+        ttk.Label(
+            dev_box,
+            text="Federal University of Paraíba (UFPB), Brazil",
+            style="Muted.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(2, 0))
+
+        info_box = ttk.LabelFrame(body, text="Software information", padding=12)
+        info_box.grid(row=3, column=0, sticky="ew", pady=(0, 14))
+        info_box.columnconfigure(1, weight=1)
+
+        ttk.Label(info_box, text="Platforms:").grid(row=0, column=0, sticky="w", padx=(0, 10))
+        ttk.Label(info_box, text="Windows, Linux and macOS").grid(row=0, column=1, sticky="w")
+
+        ttk.Label(info_box, text="License:").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=(6, 0))
+        ttk.Label(info_box, text="MIT").grid(row=1, column=1, sticky="w", pady=(6, 0))
+
+        ttk.Label(info_box, text="Website:").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=(6, 0))
+        ttk.Label(info_box, text="topiso3d.ufpb.com").grid(row=2, column=1, sticky="w", pady=(6, 0))
+
+        def _open_url(url: str) -> None:
+            try:
+                if not webbrowser.open_new_tab(url):
+                    raise RuntimeError("The default browser did not accept the request.")
+            except Exception as e:
+                messagebox.showerror(
+                    "About TopIso3D",
+                    f"Could not open the requested resource.\n\n{url}\n\nDetails: {e}",
+                    parent=win,
+                )
+
+        btns = ttk.Frame(body)
+        btns.grid(row=4, column=0, sticky="ew")
+        btns.columnconfigure(0, weight=1)
+        btns.columnconfigure(1, weight=1)
+        btns.columnconfigure(2, weight=1)
+
+        ttk.Button(
+            btns,
+            text="TopIso3D Website",
+            command=lambda: _open_url("https://topiso3d.ufpb.com"),
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+
+        ttk.Button(
+            btns,
+            text="GitHub Repository",
+            command=lambda: _open_url("https://github.com/arymaia/TopIso3D_v2026"),
+        ).grid(row=0, column=1, sticky="ew", padx=6)
+
+        ttk.Button(
+            btns,
+            text="Close",
+            command=win.destroy,
+        ).grid(row=0, column=2, sticky="ew", padx=(6, 0))
+
+        try:
+            win.update_idletasks()
+            px = self.winfo_rootx() + max(0, (self.winfo_width() - win.winfo_width()) // 2)
+            py = self.winfo_rooty() + max(0, (self.winfo_height() - win.winfo_height()) // 2)
+            win.geometry(f"+{px}+{py}")
+        except Exception:
+            pass
 
     def _cleanup_run_temp_files(self, run_dir: Path, tag: str = "RUN") -> None:
         """Best-effort cleanup of temporary CRYSTAL/Properties files copied into a run folder.
@@ -11180,6 +11429,7 @@ def _export_pl2d_campaign(self):
             "execution_mode": "exported",
             "status": "ready_for_execution",
             "execution_mode": "exported_campaign",
+            "n_slices": int(cfg.get("n_slices", max(0, len(zs) - 1))),
             "slice_count": len(zs),
             "expected_outputs": [f"{key}.DAT" for key in cfg.get("iso", [])],
         }
@@ -11300,6 +11550,15 @@ def _run_pl2d(self):
     except Exception:
         f9_fp = {}
 
+    ns = int(cfg["n_slices"])
+    zmin = float(cfg["zmin"])
+    zmax = float(cfg["zmax"])
+    if ns <= 0:
+        zs = [zmin]
+    else:
+        dz = (zmax - zmin) / ns
+        zs = [zmin + i * dz for i in range(ns + 1)]
+
     mf = {
         "signature": sig,
         "created_at": ts,
@@ -11309,17 +11568,11 @@ def _run_pl2d(self):
         "project_name": str(cfg.get("project_name", "") or "") if bool(cfg.get("project_name_custom", False)) else "",
         "source": {"fort9": str(fort9_src), "fort9_fp": f9_fp},
         "status": "running",
+        "n_slices": ns,
+        "slice_count": len(zs),
+        "expected_outputs": [f"{key}.DAT" for key in cfg.get("iso", [])],
     }
     (run_dir / "manifest.json").write_text(json.dumps(mf, indent=2), encoding="utf-8")
-
-    ns = int(cfg["n_slices"])
-    zmin = float(cfg["zmin"])
-    zmax = float(cfg["zmax"])
-    if ns <= 0:
-        zs = [zmin]
-    else:
-        dz = (zmax - zmin) / ns
-        zs = [zmin + i * dz for i in range(ns + 1)]
 
     iso_set = set(cfg["iso"])
     flags = [
@@ -11921,6 +12174,133 @@ class PL2DViewerPage(BasePage):
         slices = sorted([p for p in run_dir.glob("slice*") if p.is_dir() and p.name[5:].isdigit()])
         return slices
 
+    def _check_campaign_integrity(self, run_dir: Path) -> dict:
+        """Compare existing PL2D slice folders with the campaign metadata.
+
+        New campaigns store both n_slices (intervals) and slice_count (planes).
+        For legacy campaigns, fall back to config.n_slices when available.
+        """
+        result = {
+            "known": False,
+            "ok": True,
+            "expected_count": None,
+            "found_count": 0,
+            "missing": [],
+            "unexpected": [],
+            "message": "",
+        }
+
+        slices = self._detect_slices(run_dir)
+        found_names = {p.name for p in slices}
+        result["found_count"] = len(found_names)
+
+        manifest = {}
+        mf = Path(run_dir) / "manifest.json"
+        try:
+            if mf.exists():
+                manifest = json.loads(mf.read_text(encoding="utf-8"))
+        except Exception:
+            manifest = {}
+
+        expected_count = None
+        try:
+            raw = manifest.get("slice_count")
+            if raw is not None:
+                expected_count = int(raw)
+        except Exception:
+            expected_count = None
+
+        # Legacy fallback: n_slices is the number of intervals, therefore
+        # the expected number of planes/directories is n_slices + 1.
+        if expected_count is None:
+            try:
+                raw_ns = manifest.get("n_slices")
+                if raw_ns is None:
+                    raw_ns = (manifest.get("config") or {}).get("n_slices")
+                if raw_ns is not None:
+                    expected_count = int(raw_ns) + 1
+            except Exception:
+                expected_count = None
+
+        if expected_count is None or expected_count < 0:
+            result["message"] = "Campaign integrity cannot be verified: expected slice count is not available in metadata."
+            return result
+
+        result["known"] = True
+        result["expected_count"] = expected_count
+
+        expected_names = {f"slice{i:03d}" for i in range(expected_count)}
+        missing = sorted(expected_names - found_names)
+        unexpected = sorted(found_names - expected_names)
+
+        result["missing"] = missing
+        result["unexpected"] = unexpected
+        result["ok"] = (not missing) and (not unexpected) and (len(found_names) == expected_count)
+
+        if result["ok"]:
+            result["message"] = f"Campaign integrity OK: {expected_count} expected slices found."
+        else:
+            parts = [
+                f"Incomplete PL2D campaign: expected {expected_count} slices, found {len(found_names)}."
+            ]
+            if missing:
+                preview = ", ".join(missing[:8])
+                if len(missing) > 8:
+                    preview += ", ..."
+                parts.append(f"Missing: {preview}.")
+            if unexpected:
+                preview = ", ".join(unexpected[:8])
+                if len(unexpected) > 8:
+                    preview += ", ..."
+                parts.append(f"Unexpected: {preview}.")
+            result["message"] = " ".join(parts)
+
+        return result
+
+    def _warn_if_campaign_incomplete(self, run_dir: Path, *, action: str = "use") -> dict:
+        """Re-check PL2D campaign integrity immediately before an explicit action.
+
+        The warning is informational only: after the user dismisses it, the
+        requested visualization/export continues with the data that are still
+        available. Unlike the passive run-selection warning, this check is
+        intentionally repeated for every explicit action so that a campaign
+        modified after selection is detected.
+        """
+        integrity = self._check_campaign_integrity(run_dir)
+
+        if not (integrity.get("known") and not integrity.get("ok")):
+            return integrity
+
+        message = integrity.get("message") or "The selected PL2D campaign appears to be incomplete."
+        action_label = str(action or "use").strip()
+
+        try:
+            expected = integrity.get("expected_count")
+            found = integrity.get("found_count")
+            self.lbl_run_info.config(
+                text=f"⚠ Folder: {Path(run_dir).name} | planes: {found}/{expected} | campaign incomplete"
+            )
+        except Exception:
+            pass
+
+        try:
+            self.lbl_status.config(text=message)
+        except Exception:
+            pass
+
+        try:
+            messagebox.showwarning(
+                "PL2D campaign integrity",
+                message
+                + "\n\n"
+                + f"The requested {action_label} will continue using the available slices.",
+                parent=self,
+            )
+        except Exception:
+            pass
+
+        return integrity
+
     def _available_surfaces(self, run_dir: Path) -> list[str]:
 
         s0 = run_dir / "slice000"
@@ -11942,7 +12322,37 @@ class PL2DViewerPage(BasePage):
 
         slices = self._detect_slices(rd)
         n_slices = max(0, len(slices) - 1)
-        self.lbl_run_info.config(text=f"Folder: {rd.name} | planes: {len(slices)} | n_slices={n_slices}")
+        integrity = self._check_campaign_integrity(rd)
+
+        if integrity.get("known"):
+            expected = integrity.get("expected_count")
+            if integrity.get("ok"):
+                self.lbl_run_info.config(
+                    text=f"Folder: {rd.name} | planes: {len(slices)}/{expected} | n_slices={max(0, int(expected) - 1)}"
+                )
+            else:
+                self.lbl_run_info.config(
+                    text=f"⚠ Folder: {rd.name} | planes: {len(slices)}/{expected} | campaign incomplete"
+                )
+                try:
+                    self.lbl_status.config(text=integrity.get("message") or "PL2D campaign integrity warning.")
+                except Exception:
+                    pass
+                last_warned = getattr(self, "_last_integrity_warning_run", None)
+                if last_warned != str(rd):
+                    self._last_integrity_warning_run = str(rd)
+                    try:
+                        messagebox.showwarning(
+                            "PL2D campaign integrity",
+                            integrity.get("message") or "The selected PL2D campaign appears to be incomplete.",
+                            parent=self,
+                        )
+                    except Exception:
+                        pass
+        else:
+            self.lbl_run_info.config(
+                text=f"Folder: {rd.name} | planes: {len(slices)} | n_slices={n_slices} | integrity: unknown"
+            )
 
 
         surfs = self._available_surfaces(rd)
@@ -11959,7 +12369,8 @@ class PL2DViewerPage(BasePage):
             self.surf_var.set("")
         self.refresh_state()
 
-        self.lbl_status.config(text="Ready to visualize.")
+        if not (integrity.get("known") and not integrity.get("ok")):
+            self.lbl_status.config(text="Ready to visualize.")
         self.refresh_state()
 
     def _on_surf_selected(self):
@@ -12214,6 +12625,9 @@ class PL2DViewerPage(BasePage):
         if not surf:
             messagebox.showwarning("PL2D Viewer", "Select an isosurface type.")
             return
+
+        self._warn_if_campaign_incomplete(rd, action="CUBE export")
+
         try:
             vol = self._load_volume(rd, surf, compute_only_minmax=False)
             n_planes, nptx, npty = vol.shape
@@ -12259,6 +12673,10 @@ class PL2DViewerPage(BasePage):
             messagebox.showwarning("PL2D Viewer", "Select an isosurface type.")
             return
 
+        self._warn_if_campaign_incomplete(
+            rd,
+            action=("HTML export" if export_html else "visualization"),
+        )
 
         lap_cs = None
         try:
@@ -14008,6 +14426,7 @@ class ATBPPage(BasePage):
         frm_out.pack(fill="x", pady=(0, 10))
 
         self.var_atbp_mode = tk.StringVar(value="STD")
+        self.var_atbp_parameters = tk.StringVar(value="")
         self.var_out = tk.StringVar(value="")
         self.var_atbp_run = tk.StringVar(value="—")
 
@@ -14036,6 +14455,7 @@ class ATBPPage(BasePage):
             self.cmb_atbp_mode.current(0)
         except Exception:
             pass
+        self.cmb_atbp_mode.bind("<<ComboboxSelected>>", self._on_atbp_mode_changed)
 
         self.btn_abort = ttk.Button(row1, text="Abort", command=lambda: self.app.abort_current_job("ATBP"))
         self.btn_abort.pack(side="right")
@@ -14043,6 +14463,26 @@ class ATBPPage(BasePage):
 
         self.btn_run = ttk.Button(row1, text="Run ATBP", command=self._run_atbp)
         self.btn_run.pack(side="right", padx=(0, 8))
+
+        row_params = ttk.Frame(frm_out)
+        row_params.pack(fill="x", padx=10, pady=(0, 8))
+        ttk.Label(row_params, text="Parameters:").pack(side="left", padx=(0, 6))
+        ttk.Label(
+            row_params,
+            textvariable=self.var_atbp_parameters,
+            anchor="w",
+            justify="left",
+        ).pack(side="left", fill="x", expand=True)
+
+        row_tol = ttk.Frame(frm_out)
+        row_tol.pack(fill="x", padx=10, pady=(0, 8))
+        ttk.Label(
+            row_tol,
+            text="TOL: element-specific TOPOND default or user-defined when required.",
+            style="Muted.TLabel",
+        ).pack(side="left")
+
+        self._update_atbp_parameter_summary()
 
         self._pb_row = ttk.Frame(frm_out)
         self._pb_row.pack(fill="x", padx=10, pady=(0, 10))
@@ -14078,7 +14518,36 @@ class ATBPPage(BasePage):
         self.tree.pack(side="left", fill="both", expand=True, padx=(10, 0), pady=(0, 10))
         vsb.pack(side="right", fill="y", padx=(0, 10), pady=(0, 10))
 
+    def _atbp_parameter_summary_text(self, mode: str) -> str:
+        mode = normalize_atbp_mode(mode)
+        preset = _ATBP_MODE_PRESETS.get(mode, {})
+
+        if mode == "STD":
+            return "TOPOND STD defaults"
+
+        keys = ("NVI", "IPHI", "ITH", "IBETP", "IMUL", "IEXT", "NOSE", "ACC")
+        parts = []
+        for key in keys:
+            if key in preset:
+                parts.append(f"{key}={preset[key]}")
+        return " | ".join(parts) if parts else "—"
+
+    def _update_atbp_parameter_summary(self) -> None:
+        mode = normalize_atbp_mode(self.var_atbp_mode.get())
+        try:
+            self.var_atbp_mode.set(mode)
+        except Exception:
+            pass
+        try:
+            self.var_atbp_parameters.set(self._atbp_parameter_summary_text(mode))
+        except Exception:
+            pass
+
+    def _on_atbp_mode_changed(self, _event=None) -> None:
+        self._update_atbp_parameter_summary()
+
     def on_show(self):
+        self._update_atbp_parameter_summary()
         self._refresh_run_selector()
         self._sync_output_path()
         self.refresh_state()
@@ -14249,6 +14718,7 @@ class ATBPPage(BasePage):
             self.var_atbp_mode.set(mode)
         except Exception:
             pass
+        self._update_atbp_parameter_summary()
         include_topo = True
         true_atoms_df = getattr(self.app.ctx, "df_true_atoms", None)
         if true_atoms_df is None or getattr(true_atoms_df, "empty", True):
@@ -14874,7 +15344,7 @@ class ReportsPage(ttk.Frame):
         self.btn_open_viewer = ttk.Button(btns, text="Open Reports Viewer", command=self.open_viewer)
         self.btn_open_viewer.grid(row=0, column=2, sticky="w", padx=(8, 0))
 
-        self.hint_var = tk.StringVar(value="Use Method + Active run to inspect TRHO or TLAP results.")
+        self.hint_var = tk.StringVar(value="Reports use the current Active TRHO and Active TLAP runs selected in their respective modules.")
         ttk.Label(self.content, textvariable=self.hint_var, foreground="#555").grid(row=6, column=0, sticky="w", pady=(12, 0))
 
         self.refresh()
@@ -14891,78 +15361,70 @@ class ReportsPage(ttk.Frame):
         row1 = ttk.Frame(frm)
         row1.pack(fill="x")
         ttk.Label(row1, text="Method:").pack(side="left", padx=(0, 8))
-        self.var_report_method = tk.StringVar(value=str(getattr(self.app.ctx, "report_method", "TRHO") or "TRHO"))
-        self.cmb_report_method = ttk.Combobox(row1, textvariable=self.var_report_method, values=("TRHO", "TLAP"), state="readonly", width=10)
+        self.var_report_method = tk.StringVar(
+            value=str(getattr(self.app.ctx, "report_method", "TRHO") or "TRHO")
+        )
+        self.cmb_report_method = ttk.Combobox(
+            row1,
+            textvariable=self.var_report_method,
+            values=("TRHO", "TLAP"),
+            state="readonly",
+            width=10,
+        )
         self.cmb_report_method.pack(side="left")
-        self.cmb_report_method.bind("<<ComboboxSelected>>", lambda _e: self._on_select_report_method())
+        self.cmb_report_method.bind(
+            "<<ComboboxSelected>>",
+            lambda _e: self._on_select_report_method(),
+        )
 
         row2 = ttk.Frame(frm)
         row2.pack(fill="x", pady=(6, 0))
-        ttk.Label(row2, text="Using TRHO run:").pack(side="left", padx=(0, 8))
+        ttk.Label(row2, text="Active TRHO run:").pack(side="left", padx=(0, 8))
         self.var_active_trho_run = tk.StringVar(value="—")
-        self.cmb_active_trho = ttk.Combobox(row2, textvariable=self.var_active_trho_run, values=(), state="readonly", width=46)
-        self.cmb_active_trho.pack(side="left", fill="x", expand=True)
-        self.cmb_active_trho.bind("<<ComboboxSelected>>", lambda _e: self._on_select_active_trho_run())
+        ttk.Label(
+            row2,
+            textvariable=self.var_active_trho_run,
+            anchor="w",
+        ).pack(side="left", fill="x", expand=True)
 
         row3 = ttk.Frame(frm)
         row3.pack(fill="x", pady=(6, 0))
-        ttk.Label(row3, text="Using TLAP run:").pack(side="left", padx=(0, 8))
+        ttk.Label(row3, text="Active TLAP run:").pack(side="left", padx=(0, 8))
         self.var_active_tlap_run = tk.StringVar(value="—")
-        self.cmb_active_tlap = ttk.Combobox(row3, textvariable=self.var_active_tlap_run, values=(), state="readonly", width=46)
-        self.cmb_active_tlap.pack(side="left", fill="x", expand=True)
-        self.cmb_active_tlap.bind("<<ComboboxSelected>>", lambda _e: self._on_select_active_tlap_run())
-
-        self._trho_run_options = {}
-        self._tlap_run_options = {}
+        ttk.Label(
+            row3,
+            textvariable=self.var_active_tlap_run,
+            anchor="w",
+        ).pack(side="left", fill="x", expand=True)
 
     def _on_select_report_method(self):
-        self.app.ctx.report_method = (self.var_report_method.get() or "TRHO").strip().upper()
+        self.app.ctx.report_method = (
+            self.var_report_method.get() or "TRHO"
+        ).strip().upper()
         self.refresh()
 
     def _refresh_run_selectors(self):
         app = self.app
-        self.var_report_method.set(str(getattr(app.ctx, "report_method", "TRHO") or "TRHO").strip().upper())
-        values, options, active_label = app._get_trho_run_selector_data()
-        self._trho_run_options = options
-        self.cmb_active_trho.configure(values=values)
-        self.var_active_trho_run.set(active_label if values else "—")
-        values_t, options_t, active_label_t = app._get_tlap_run_selector_data()
-        self._tlap_run_options = options_t
-        self.cmb_active_tlap.configure(values=values_t)
-        self.var_active_tlap_run.set(active_label_t if values_t else "—")
-        method = self.var_report_method.get().strip().upper()
-        self.cmb_active_trho.configure(state=("readonly" if (method == "TRHO" and values and not app._job_running) else "disabled"))
-        self.cmb_active_tlap.configure(state=("readonly" if (method == "TLAP" and values_t and not app._job_running) else "disabled"))
+        self.var_report_method.set(
+            str(getattr(app.ctx, "report_method", "TRHO") or "TRHO").strip().upper()
+        )
 
-    def _on_select_active_trho_run(self):
-        choice = (self.var_active_trho_run.get() or "").strip()
-        run_dir = self._trho_run_options.get(choice)
-        if run_dir is None:
-            return
+        # Reports is intentionally read-only with respect to Active runs.
+        # Active TRHO/TLAP runs are selected only in their respective modules.
         try:
-            current = getattr(self.app.state, "active_trho_run", None)
-            if current is not None and Path(current).resolve() == Path(run_dir).resolve():
-                return
+            app._sync_active_trho_state()
         except Exception:
             pass
-        self.app._set_active_trho_run(Path(run_dir), refresh=True)
-        self.app.set_status(f"Active TRHO run: {self.app._friendly_trho_run_label(Path(run_dir))}")
-        self.refresh()
-
-    def _on_select_active_tlap_run(self):
-        choice = (self.var_active_tlap_run.get() or "").strip()
-        run_dir = self._tlap_run_options.get(choice)
-        if run_dir is None:
-            return
         try:
-            current = getattr(self.app.state, "active_tlap_run", None)
-            if current is not None and Path(current).resolve() == Path(run_dir).resolve():
-                return
+            app._sync_active_tlap_state()
         except Exception:
             pass
-        self.app._set_active_tlap_run(Path(run_dir), refresh=True)
-        self.app.set_status(f"Active TLAP run: {self.app._friendly_tlap_run_label(Path(run_dir))}")
-        self.refresh()
+
+        _values, _options, active_trho_label = app._get_trho_run_selector_data()
+        _values_t, _options_t, active_tlap_label = app._get_tlap_run_selector_data()
+
+        self.var_active_trho_run.set(active_trho_label if active_trho_label else "—")
+        self.var_active_tlap_run.set(active_tlap_label if active_tlap_label else "—")
 
     def refresh(self):
         self._refresh_run_selectors()
