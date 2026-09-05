@@ -2,24 +2,36 @@
 # -*- coding: utf-8 -*-
 
 """
-TopIso3D v2026 - Workspace + TRHO/TLAP Runner (auto-validate, no Validate button)
+TopIso3D v2026.1
+================
 
-Fluxo:
-1) Choose folder…
-   -> valida automaticamente (sem botão)
-      - OK se existir fort.9 OU existir pelo menos um *.f9
-      - e se tiver permissão de escrita
-2) Compute habilita se workspace OK
-3) Run TRHO:
-   -> garante fort.9:
-      - se já existe: usa
-      - se não existe e há exatamente 1 *.f9: cria symlink fort.9 -> arquivo.f9 (fallback: copia)
-      - se há vários *.f9: pede confirmação (caso raro)
-   -> roda TRHO (MOCK por padrão: progress + log)
+Cross-platform environment for topological analysis of periodic
+electronic-structure calculations using CRYSTAL/TOPOND.
 
-Para usar com TRHO real:
-- substituir build_trho_command()
-- e descomentar o bloco REAL EXECUTION no worker
+TopIso3D provides an integrated graphical environment for preparing,
+executing, parsing, inspecting, visualizing, and exporting results from
+TOPOND topological analyses, including TRHO, TLAP, PL2D, and ATBP
+workflows.
+
+Author
+------
+Ary da Silva Maia
+Federal University of Paraiba (UFPB), Brazil
+
+Project
+-------
+TopIso3D
+Version: v2026.1
+Website: https://www.topiso3d.ufpb.br
+Repository: https://github.com/arymaia/TopIso3D_v2026
+
+License
+-------
+MIT License
+Copyright (c) 2026 Ary da Silva Maia
+
+This software is distributed under the terms of the MIT License.
+See the LICENSE file distributed with the source code for details.
 """
 
 from __future__ import annotations
@@ -726,8 +738,64 @@ def parse_output_name_list(raw, default_names: List[str]) -> List[str]:
     return defaults
 
 
+def normalize_configured_output_names(raw, default_names: List[str]) -> List[str]:
+    """Return configured output aliases while always preserving TopIso3D canonical names.
+
+    Older TopIso3D releases could persist only legacy ``*.outp`` names in
+    settings.json.  Current runs are written as ``*.out``.  If those legacy
+    settings are reused after an upgrade, a freshly completed run can be parsed
+    correctly yet remain invisible to Active Run discovery and downstream
+    viewers.
+
+    Canonical/default names are therefore mandatory discovery aliases; any
+    user-configured names are retained as additional aliases.  Matching is
+    case-insensitive and order is stable.
+    """
+    configured = parse_output_name_list(raw, [])
+    canonical = parse_output_name_list(default_names, [])
+    merged: List[str] = []
+    seen = set()
+    for name in canonical + configured:
+        token = _sanitize_output_name_token(name)
+        if not token:
+            continue
+        low = token.lower()
+        if low in seen:
+            continue
+        seen.add(low)
+        merged.append(token)
+    return merged
+
+
+def migrate_output_name_settings(data: dict) -> tuple[dict, bool]:
+    """Normalize legacy output-name settings in place and report changes.
+
+    This is intentionally platform-independent: the issue was exposed on macOS
+    by an older persistent settings.json, but the same stale configuration can
+    follow an upgrade on any supported OS.
+    """
+    if not isinstance(data, dict):
+        data = {}
+    changed = False
+    specs = (
+        ("trho_output_names", DEFAULT_TRHO_OUTPUT_NAMES),
+        ("tlap_output_names", DEFAULT_TLAP_OUTPUT_NAMES),
+        ("atbp_output_names", DEFAULT_ATBP_OUTPUT_NAMES),
+    )
+    for key, defaults in specs:
+        before = parse_output_name_list(data.get(key), [])
+        after = normalize_configured_output_names(data.get(key), defaults)
+        if before != after:
+            data[key] = after
+            changed = True
+        elif key not in data:
+            data[key] = after
+            changed = True
+    return data, changed
+
+
 def format_output_name_list(names, default_names: List[str]) -> str:
-    vals = parse_output_name_list(names, default_names)
+    vals = normalize_configured_output_names(names, default_names)
     return "; ".join(vals)
 
 def resolve_executable(exe: str | os.PathLike | None) -> Optional[Path]:
@@ -3198,9 +3266,9 @@ class SettingsDialog(tk.Toplevel):
             if cleanup_policy not in ("minimal", "standard", "none"):
                 cleanup_policy = "minimal"
             data["cleanup_policy"] = cleanup_policy
-            data["trho_output_names"] = parse_output_name_list(self.var_trho_outputs.get(), DEFAULT_TRHO_OUTPUT_NAMES)
-            data["tlap_output_names"] = parse_output_name_list(self.var_tlap_outputs.get(), DEFAULT_TLAP_OUTPUT_NAMES)
-            data["atbp_output_names"] = parse_output_name_list(self.var_atbp_outputs.get(), DEFAULT_ATBP_OUTPUT_NAMES)
+            data["trho_output_names"] = normalize_configured_output_names(self.var_trho_outputs.get(), DEFAULT_TRHO_OUTPUT_NAMES)
+            data["tlap_output_names"] = normalize_configured_output_names(self.var_tlap_outputs.get(), DEFAULT_TLAP_OUTPUT_NAMES)
+            data["atbp_output_names"] = normalize_configured_output_names(self.var_atbp_outputs.get(), DEFAULT_ATBP_OUTPUT_NAMES)
 
             try:
                 scheme_label = self.var_lap_scheme.get().strip()
@@ -3220,9 +3288,9 @@ class SettingsDialog(tk.Toplevel):
             self.app.state.laplacian_scheme = (data.get("laplacian_scheme") or "blue_red").strip() or "blue_red"
             self.app.state.nna_cutoff_ang = float(data.get("nna_cutoff_ang", 0.35) or 0.35)
             self.app.state.cleanup_policy = str(data.get("cleanup_policy") or "minimal").strip().lower() or "minimal"
-            self.app._settings["trho_output_names"] = parse_output_name_list(data.get("trho_output_names"), DEFAULT_TRHO_OUTPUT_NAMES)
-            self.app._settings["tlap_output_names"] = parse_output_name_list(data.get("tlap_output_names"), DEFAULT_TLAP_OUTPUT_NAMES)
-            self.app._settings["atbp_output_names"] = parse_output_name_list(data.get("atbp_output_names"), DEFAULT_ATBP_OUTPUT_NAMES)
+            self.app._settings["trho_output_names"] = normalize_configured_output_names(data.get("trho_output_names"), DEFAULT_TRHO_OUTPUT_NAMES)
+            self.app._settings["tlap_output_names"] = normalize_configured_output_names(data.get("tlap_output_names"), DEFAULT_TLAP_OUTPUT_NAMES)
+            self.app._settings["atbp_output_names"] = normalize_configured_output_names(data.get("atbp_output_names"), DEFAULT_ATBP_OUTPUT_NAMES)
 
 
             try:
@@ -3455,9 +3523,9 @@ class App(tk.Tk):
 
 
         self._settings = load_settings()
-        self._settings["trho_output_names"] = parse_output_name_list(self._settings.get("trho_output_names"), DEFAULT_TRHO_OUTPUT_NAMES)
-        self._settings["tlap_output_names"] = parse_output_name_list(self._settings.get("tlap_output_names"), DEFAULT_TLAP_OUTPUT_NAMES)
-        self._settings["atbp_output_names"] = parse_output_name_list(self._settings.get("atbp_output_names"), DEFAULT_ATBP_OUTPUT_NAMES)
+        self._settings, _output_settings_migrated = migrate_output_name_settings(self._settings)
+        if _output_settings_migrated:
+            save_settings(self._settings)
         pexe = (self._settings.get("properties_exe") or "").strip()
         if pexe:
             self.state.properties_exe = Path(pexe)
@@ -5084,7 +5152,7 @@ class App(tk.Tk):
             "tlap_output_names": DEFAULT_TLAP_OUTPUT_NAMES,
             "atbp_output_names": DEFAULT_ATBP_OUTPUT_NAMES,
         }
-        return parse_output_name_list(self._settings.get(key), defaults.get(key, []))
+        return normalize_configured_output_names(self._settings.get(key), defaults.get(key, []))
 
     def _find_matching_output_in_dirs(self, base_dirs, accepted_names: List[str]) -> Optional[Path]:
         names = parse_output_name_list(accepted_names, [])
@@ -5437,6 +5505,9 @@ class App(tk.Tk):
                 self._job_queue.put(("log", f"[TRHO] inp: {inp_path.name}"))
                 self._job_queue.put(("log", f"[TRHO] out: {out_path.name}"))
 
+                # Item 38: finish writing and close trho.out before parsing it.
+                # This avoids platform-dependent buffered I/O exposing a partial
+                # file to parse_trho_out() immediately after properties exits.
                 with open(inp_path, "r", encoding="utf-8") as fin, open(out_path, "w", encoding="utf-8") as fout:
                     p = subprocess.Popen(
                         [str(exe_resolved)],
@@ -5451,100 +5522,88 @@ class App(tk.Tk):
                     )
                     self._register_active_process(p, "TRHO")
 
-
                     self._job_queue.put(("progress", 0, 0))
-
 
                     for line in p.stdout:
                         self._job_queue.put(("log", line.rstrip("\n")))
                         fout.write(line)
 
                     p.wait()
-
                     rc = p.returncode
-                    self._clear_active_process(p)
-                    self._cleanup_run_temp_files(trho_dir, "TRHO")
+
+                # fin/fout are now closed; trho.out is stable on disk.
+                self._clear_active_process(p)
+                self._cleanup_run_temp_files(trho_dir, "TRHO")
+                try:
+                    _t1 = _time.time()
+                    if isinstance(getattr(self.state, "last_execution", None), dict):
+                        self.state.last_execution["exit_code"] = rc
+                        self.state.last_execution["duration_s"] = float(_t1 - _t0)
+                except Exception:
+                    pass
+                if rc == 0 and out_path.exists():
+
+
+                    issue = detect_trho_output_issue(out_path)
+                    if issue is not None:
+                        failure_reason = issue.get("message", issue.get("title", "TRHO output issue"))
+                        try:
+                            meta = self._build_trho_run_metadata(trho_dir, trho_cfg)
+                            meta["status"] = "failed"
+                            meta["failure_kind"] = issue.get("kind", "output_issue")
+                            meta["failure_reason"] = failure_reason
+                            _write_json_file(trho_dir / "run.json", meta)
+                        except Exception:
+                            pass
+                        self._job_queue.put(("trho_issue", issue, str(trho_dir)))
+                        return
+
+                    # Item 39: parse this newly completed run locally first.
+                    # The shared scientific cache must continue to represent the
+                    # confirmed Active TRHO run until the user promotes this run.
                     try:
-                        _t1 = _time.time()
-                        if isinstance(getattr(self.state, "last_execution", None), dict):
-                            self.state.last_execution["exit_code"] = rc
-                            self.state.last_execution["duration_s"] = float(_t1 - _t0)
-                    except Exception:
-                        pass
-                    if rc == 0 and out_path.exists():
 
+                        parsed = parse_trho_out(
+                            out_path,
+                            open_shell=getattr(self.state, "open_shell", False),
+                            slab_2d=getattr(self.state, "slab_2d", False),
+                            nna_cutoff_ang=float(getattr(self.state, "nna_cutoff_ang", 0.35) or 0.35),
+                        )
 
-                        issue = detect_trho_output_issue(out_path)
+                        issue = detect_trho_output_issue(out_path, parsed)
                         if issue is not None:
-                            self.state.trho_parsed = None
-                            self.state.trho_done = True
-                            self.state.trho_output_issue = issue
-                            self.state.trho_parse_error = issue.get("message", issue.get("title", "TRHO output issue"))
+                            failure_reason = issue.get("message", issue.get("title", "TRHO output issue"))
                             try:
                                 meta = self._build_trho_run_metadata(trho_dir, trho_cfg)
                                 meta["status"] = "failed"
                                 meta["failure_kind"] = issue.get("kind", "output_issue")
-                                meta["failure_reason"] = self.state.trho_parse_error
+                                meta["failure_reason"] = failure_reason
                                 _write_json_file(trho_dir / "run.json", meta)
                             except Exception:
                                 pass
                             self._job_queue.put(("trho_issue", issue, str(trho_dir)))
                             return
 
-                        self.state.trho_done = True
-                        self.state.trho_parse_error = None
-                        self.state.trho_output_issue = None
-                        try:
 
-                            parsed = parse_trho_out(
-                                out_path,
-                                open_shell=getattr(self.state, "open_shell", False),
-                                slab_2d=getattr(self.state, "slab_2d", False),
-                                nna_cutoff_ang=float(getattr(self.state, "nna_cutoff_ang", 0.35) or 0.35),
-                            )
+                        summary = f"Parsed OK. TRUE atoms: {len(parsed.df_true_atoms)} | BCPs: {len(parsed.df_bcp_props)} | RCPs: {len(parsed.df_ring)} | CCPs: {len(parsed.df_cage)}"
+                        self._job_queue.put(("log", "[TRHO] " + summary))
+                        meta = self._build_trho_run_metadata(trho_dir, trho_cfg)
+                        _write_json_file(trho_dir / "run.json", meta)
+                        self._job_queue.put(("parsed", summary))
+                        self._job_queue.put((
+                            "trho_run_ready",
+                            str(trho_dir),
+                            self._friendly_trho_run_label(trho_dir),
+                            parsed,
+                            str(out_path),
+                        ))
 
-                            issue = detect_trho_output_issue(out_path, parsed)
-                            if issue is not None:
-                                self.state.trho_parsed = None
-                                self.state.trho_done = True
-                                self.state.trho_output_issue = issue
-                                self.state.trho_parse_error = issue.get("message", issue.get("title", "TRHO output issue"))
-                                try:
-                                    meta = self._build_trho_run_metadata(trho_dir, trho_cfg)
-                                    meta["status"] = "failed"
-                                    meta["failure_kind"] = issue.get("kind", "output_issue")
-                                    meta["failure_reason"] = self.state.trho_parse_error
-                                    _write_json_file(trho_dir / "run.json", meta)
-                                except Exception:
-                                    pass
-                                self._job_queue.put(("trho_issue", issue, str(trho_dir)))
-                                return
+                    except Exception as e:
 
+                        self._job_queue.put(("log", f"[TRHO] parsing failed: {e}"))
+                        self._job_queue.put(("parse_error", str(e)))
 
-                            self.state.trho_parsed = parsed
-                            self.state.trho_done = True
-                            self.state.trho_output_issue = None
-
-
-                            self.state.df_bcp_props = parsed.df_bcp_props
-                            self.state.df_true_atoms = parsed.df_true_atoms
-
-                            summary = f"Parsed OK. TRUE atoms: {len(parsed.df_true_atoms)} | BCPs: {len(parsed.df_bcp_props)} | RCPs: {len(parsed.df_ring)} | CCPs: {len(parsed.df_cage)}"
-                            self._job_queue.put(("log", "[TRHO] " + summary))
-                            meta = self._build_trho_run_metadata(trho_dir, trho_cfg)
-                            _write_json_file(trho_dir / "run.json", meta)
-                            self._job_queue.put(("parsed", summary))
-                            self._job_queue.put(("trho_run_ready", str(trho_dir), self._friendly_trho_run_label(trho_dir)))
-
-                        except Exception as e:
-
-                            self.state.trho_parsed = None
-                            self.state.trho_done = True
-                            self.state.trho_parse_error = str(e)
-                            self._job_queue.put(("log", f"[TRHO] parsing failed: {e}"))
-                            self._job_queue.put(("parse_error", str(e)))
-
-                    self._job_queue.put(("done", rc))
+                self._job_queue.put(("done", rc))
 
 
             except Exception as e:
@@ -5626,6 +5685,11 @@ class App(tk.Tk):
                 self._job_queue.put(("log", f"[TLAP] inp: {inp_path.name}"))
                 self._job_queue.put(("log", f"[TLAP] out: {out_path.name}"))
 
+                # Item 38 (expanded): never publish/process TLAP output while
+                # tlap.out is still open for buffered writing.  On Windows the
+                # main Tk thread can consume tlap_done immediately, so queuing
+                # that event inside this with-block creates a race in which the
+                # parser may read a partial file.
                 with open(inp_path, "r", encoding="utf-8") as fin, open(out_path, "w", encoding="utf-8") as fout:
                     p = subprocess.Popen(
                         [str(exe_path)],
@@ -5646,13 +5710,16 @@ class App(tk.Tk):
 
                     p.wait()
                     rc = p.returncode
-                    self._clear_active_process(p)
-                    self._cleanup_run_temp_files(tlap_dir, "TLAP")
-                    label = self._friendly_tlap_run_label(tlap_dir)
-                    if rc == 0 and out_path.exists():
-                        self._job_queue.put(("tlap_done", str(out_path), str(tlap_dir), label))
-                    else:
-                        self._job_queue.put(("tlap_fail", f"TLAP failed (rc={rc})", str(tlap_dir)))
+
+                # fin/fout are now closed; tlap.out is stable on disk before
+                # cleanup, metadata/UI notification, or any downstream parse.
+                self._clear_active_process(p)
+                self._cleanup_run_temp_files(tlap_dir, "TLAP")
+                label = self._friendly_tlap_run_label(tlap_dir)
+                if rc == 0 and out_path.exists():
+                    self._job_queue.put(("tlap_done", str(out_path), str(tlap_dir), label))
+                else:
+                    self._job_queue.put(("tlap_fail", f"TLAP failed (rc={rc})", str(tlap_dir)))
             except Exception as e:
                 self._clear_active_process()
                 self._job_queue.put(("tlap_fail", str(e), str(tlap_dir)))
@@ -5962,31 +6029,60 @@ class App(tk.Tk):
                 elif kind == "trho_run_ready":
                     run_dir = Path(item[1])
                     label = str(item[2])
+                    parsed = item[3] if len(item) > 3 else None
+                    parsed_out_path = Path(item[4]) if len(item) > 4 and item[4] else (run_dir / "trho.out")
+
                     existing_active = self._get_active_trho_dir()
                     is_first = existing_active is None or not Path(existing_active).exists()
+                    promote_to_active = False
+
                     if is_first:
-                        self._set_active_trho_run(run_dir, refresh=False)
-                        self.state.active_trho_run = run_dir
-                        self.state.active_trho_label = label
-                        self.task_log(f"[TRHO] active run set automatically: {label}")
+                        promote_to_active = True
                     else:
                         try:
-                            if existing_active.resolve() != run_dir.resolve():
-                                answer = messagebox.askyesno(
+                            if existing_active.resolve() == run_dir.resolve():
+                                promote_to_active = True
+                            else:
+                                promote_to_active = messagebox.askyesno(
                                     "Active TRHO result",
                                     f"TRHO run saved as {run_dir.name}.\n\nDo you want to set it as the active TRHO result?"
                                 )
-                                if answer:
-                                    self._set_active_trho_run(run_dir, refresh=False)
-                                    self.state.active_trho_run = run_dir
-                                    self.state.active_trho_label = label
-                                    self.task_log(f"[TRHO] active run changed to: {label}")
-                            else:
-                                self._set_active_trho_run(run_dir, refresh=False)
-                                self.state.active_trho_run = run_dir
-                                self.state.active_trho_label = label
                         except Exception:
-                            pass
+                            promote_to_active = False
+
+                    if promote_to_active:
+                        self._set_active_trho_run(run_dir, refresh=False)
+                        self.state.active_trho_run = run_dir
+                        self.state.active_trho_label = label
+
+                        if parsed is not None:
+                            self.state.trho_parsed = parsed
+                            self.state.df_bcp_props = parsed.df_bcp_props
+                            self.state.df_true_atoms = parsed.df_true_atoms
+                            self.state.trho_done = True
+                            self.state.trho_parse_error = None
+                            self.state.trho_output_issue = None
+                            try:
+                                self.state.trho_parse_attempted_out = str(parsed_out_path.resolve())
+                            except Exception:
+                                self.state.trho_parse_attempted_out = str(parsed_out_path)
+                        else:
+                            # Compatibility fallback for legacy queue payloads.
+                            self.state.trho_parse_attempted_out = ""
+                            self.auto_parse_trho_if_exists()
+
+                        if is_first:
+                            self.task_log(f"[TRHO] active run set automatically: {label}")
+                        else:
+                            self.task_log(f"[TRHO] active run changed to: {label}")
+                    else:
+                        # Keep both the Active-run label and its scientific cache.
+                        self.state.trho_done = self.state.trho_parsed is not None
+                        if self.state.trho_parsed is None:
+                            self.state.trho_parse_attempted_out = ""
+                            self.auto_parse_trho_if_exists()
+                        self.task_log(f"[TRHO] run saved; active run kept: {self.state.active_trho_label}")
+
                     self.refresh_all_pages()
 
                 elif kind == "parsed":
@@ -6010,9 +6106,7 @@ class App(tk.Tk):
                     msg = issue.get("message", issue.get("title", "TRHO output issue")) if isinstance(issue, dict) else str(issue)
                     title = issue.get("title", "TRHO output issue") if isinstance(issue, dict) else "TRHO output issue"
                     kind_txt = issue.get("kind", "output issue") if isinstance(issue, dict) else "output issue"
-                    self.state.trho_done = True
-                    self.state.trho_parsed = None
-                    self.state.trho_parse_error = msg
+                    self.state.trho_done = self.state.trho_parsed is not None
                     self.state.trho_output_issue = issue if isinstance(issue, dict) else {"kind": kind_txt, "message": msg}
                     self.set_status(f"TRHO failed ({kind_txt})")
                     self.task_log(f"[TRHO] failed: {title}")
@@ -6298,7 +6392,7 @@ class App(tk.Tk):
         ttk.Button(
             resources,
             text="TopIso3D Website",
-            command=lambda: _open_url("https://topiso3d.ufpb.com"),
+            command=lambda: _open_url("https://www.topiso3d.ufpb.br"),
         ).grid(row=0, column=0, sticky="ew", padx=(0, 6), pady=(0, 8))
 
         ttk.Button(
@@ -6465,7 +6559,7 @@ class App(tk.Tk):
         ttk.Label(info_box, text="MIT").grid(row=1, column=1, sticky="w", pady=(6, 0))
 
         ttk.Label(info_box, text="Website:").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=(6, 0))
-        ttk.Label(info_box, text="topiso3d.ufpb.com").grid(row=2, column=1, sticky="w", pady=(6, 0))
+        ttk.Label(info_box, text="www.topiso3d.ufpb.br").grid(row=2, column=1, sticky="w", pady=(6, 0))
 
         def _open_url(url: str) -> None:
             try:
@@ -6487,7 +6581,7 @@ class App(tk.Tk):
         ttk.Button(
             btns,
             text="TopIso3D Website",
-            command=lambda: _open_url("https://topiso3d.ufpb.com"),
+            command=lambda: _open_url("https://www.topiso3d.ufpb.br"),
         ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
 
         ttk.Button(
@@ -7190,6 +7284,10 @@ class App(tk.Tk):
                 except Exception:
                     pass
 
+                # Item 38 (expanded): close atbp.out before inspecting/parsing
+                # it.  Reading it from inside the same buffered write context can
+                # expose only a prefix of the output on Windows and trigger a
+                # false "no charge values" protection warning.
                 with open(inp_path, "r", encoding="utf-8") as fin, open(out_path, "w", encoding="utf-8") as fout:
                     p = subprocess.Popen(
                         [str(exe_path)],
@@ -7209,18 +7307,20 @@ class App(tk.Tk):
                         fout.write(line)
 
                     p.wait()
-
                     rc = p.returncode
-                    self._clear_active_process(p)
-                    self._cleanup_run_temp_files(atbp_dir, "ATBP")
-                    if rc == 0 and out_path.exists():
-                        issue = self._inspect_atbp_output(out_path)
-                        if issue is None:
-                            self._job_queue.put(("atbp_done", str(out_path), str(atbp_dir)))
-                        else:
-                            self._job_queue.put(("atbp_issue", issue, str(out_path), str(atbp_dir)))
+
+                # fin/fout are now closed; atbp.out is stable on disk before
+                # cleanup, inspection, parsing, and UI notification.
+                self._clear_active_process(p)
+                self._cleanup_run_temp_files(atbp_dir, "ATBP")
+                if rc == 0 and out_path.exists():
+                    issue = self._inspect_atbp_output(out_path)
+                    if issue is None:
+                        self._job_queue.put(("atbp_done", str(out_path), str(atbp_dir)))
                     else:
-                        self._job_queue.put(("atbp_fail", f"ATBP failed (rc={rc})", str(atbp_dir)))
+                        self._job_queue.put(("atbp_issue", issue, str(out_path), str(atbp_dir)))
+                else:
+                    self._job_queue.put(("atbp_fail", f"ATBP failed (rc={rc})", str(atbp_dir)))
 
             except Exception as e:
                 self._clear_active_process()
@@ -12729,58 +12829,334 @@ class PL2DViewerPage(BasePage):
 
         return x_coords, y_coords, z_coords
 
-    def _selected_cube_atoms(self):
-        """Return atom rows for CUBE export, using TRUE atoms when available."""
+    def _pl2d_cube_geometry(self, run_dir: Path, n_planes: int, nptx: int, npty: int) -> dict:
+        """Reconstruct the physical PL2D grid geometry for Gaussian CUBE export.
+
+        Item 22a: the previous exporter collapsed every campaign onto global X/Y/Z
+        axes.  That was only safe for one special orientation and could silently
+        misrepresent imported or future PL2D campaigns.  Here the CUBE lattice is
+        rebuilt from the three plane-defining points stored in each slice/pl2d.inp.
+
+        The first three whitespace-separated numeric triples in pl2d.inp are the
+        TOPOND plane points A, B and C (written in bohr by TopIso3D).  The last two
+        whitespace-separated triples are the local x/y grid ranges (in Angstrom,
+        following the existing PL2D Viewer convention).  A local orthonormal frame
+        is derived from A->B and the A/B/C plane, while the third CUBE vector is the
+        actual displacement between successive parallel slices.
+
+        Gaussian CUBE requires a regular 3-D lattice.  Therefore non-parallel planes,
+        changing in-plane frames/ranges, or non-uniform slice spacing are rejected
+        explicitly instead of being exported with misleading geometry.
+        """
+        bohr_to_ang = 0.529177210903
+        run_dir = Path(run_dir)
+        slices = self._detect_slices(run_dir)
+        if len(slices) != int(n_planes):
+            raise RuntimeError(
+                f"CUBE geometry mismatch: volume has {int(n_planes)} planes but "
+                f"{len(slices)} PL2D slice folders were found."
+            )
+        if int(nptx) < 2 or int(npty) < 2 or int(n_planes) < 2:
+            raise RuntimeError("CUBE export requires at least two grid points along all three axes.")
+
+        def _read_slice_geometry(inp: Path) -> dict:
+            if not inp.exists():
+                raise FileNotFoundError(f"Missing PL2D input geometry: {inp}")
+            triples = []
+            for raw in inp.read_text(encoding="utf-8", errors="ignore").splitlines():
+                line = raw.strip()
+                if (not line) or ("," in line):
+                    continue
+                parts = line.split()
+                if len(parts) != 3:
+                    continue
+                try:
+                    triples.append([float(q) for q in parts])
+                except Exception:
+                    continue
+            if len(triples) < 5:
+                raise RuntimeError(f"Could not recover PL2D plane/grid geometry from {inp}")
+
+            # A/B/C are TOPOND Cartesian coordinates in bohr.
+            a = np.asarray(triples[0], dtype=float) * bohr_to_ang
+            b = np.asarray(triples[1], dtype=float) * bohr_to_ang
+            c = np.asarray(triples[2], dtype=float) * bohr_to_ang
+            xmin, xmax, _xinc = [float(v) for v in triples[-2]]
+            ymin, ymax, _yinc = [float(v) for v in triples[-1]]
+
+            ab = b - a
+            ac = c - a
+            nab = float(np.linalg.norm(ab))
+            normal = np.cross(ab, ac)
+            nnormal = float(np.linalg.norm(normal))
+            if (not np.isfinite(nab)) or nab <= 1.0e-12:
+                raise RuntimeError(f"Degenerate PL2D plane: A and B coincide in {inp}")
+            if (not np.isfinite(nnormal)) or nnormal <= 1.0e-12:
+                raise RuntimeError(f"Degenerate PL2D plane: A, B and C are collinear in {inp}")
+
+            e1 = ab / nab
+            en = normal / nnormal
+            e2 = np.cross(en, e1)
+            ne2 = float(np.linalg.norm(e2))
+            if ne2 <= 1.0e-12:
+                raise RuntimeError(f"Could not build PL2D in-plane basis from {inp}")
+            e2 = e2 / ne2
+            # Keep the second axis directed toward C.
+            if float(np.dot(e2, ac)) < 0.0:
+                e2 = -e2
+                en = -en
+
+            return {
+                "a": a, "e1": e1, "e2": e2, "normal": en,
+                "xmin": xmin, "xmax": xmax, "ymin": ymin, "ymax": ymax,
+            }
+
+        geoms = [_read_slice_geometry(Path(sd) / "pl2d.inp") for sd in slices]
+        g0 = geoms[0]
+
+        # A CUBE lattice uses one fixed basis and fixed x/y ranges.
+        tol_dir = 5.0e-7
+        tol_range = 5.0e-7
+        for idx, gi in enumerate(geoms[1:], start=1):
+            if float(np.dot(g0["normal"], gi["normal"])) < (1.0 - tol_dir):
+                raise RuntimeError(f"CUBE export requires parallel PL2D planes; slice{idx:03d} changes plane orientation.")
+            if float(np.dot(g0["e1"], gi["e1"])) < (1.0 - tol_dir) or float(np.dot(g0["e2"], gi["e2"])) < (1.0 - tol_dir):
+                raise RuntimeError(f"CUBE export requires a constant in-plane frame; slice{idx:03d} changes PL2D axes.")
+            for key in ("xmin", "xmax", "ymin", "ymax"):
+                if abs(float(gi[key]) - float(g0[key])) > tol_range:
+                    raise RuntimeError(f"CUBE export requires identical XY ranges in every slice; {key} changes at slice{idx:03d}.")
+
+        dx = (float(g0["xmax"]) - float(g0["xmin"])) / float(int(nptx) - 1)
+        dy = (float(g0["ymax"]) - float(g0["ymin"])) / float(int(npty) - 1)
+        if abs(dx) <= 1.0e-12 or abs(dy) <= 1.0e-12:
+            raise RuntimeError("CUBE export found a zero PL2D in-plane grid spacing.")
+
+        anchors = np.vstack([gi["a"] for gi in geoms])
+        vz_ang = (anchors[-1] - anchors[0]) / float(int(n_planes) - 1)
+        if float(np.linalg.norm(vz_ang)) <= 1.0e-12:
+            raise RuntimeError("CUBE export found zero spacing between PL2D slices.")
+
+        # CUBE can only encode uniform slice spacing.
+        tol_spacing_ang = 2.0e-5
+        for iz, anchor in enumerate(anchors):
+            expected = anchors[0] + float(iz) * vz_ang
+            err = float(np.linalg.norm(anchor - expected))
+            if err > tol_spacing_ang:
+                raise RuntimeError(
+                    "CUBE export requires uniformly spaced PL2D slices; "
+                    f"slice{iz:03d} deviates by {err:.6g} Å."
+                )
+
+        origin_ang = (
+            anchors[0]
+            + float(g0["xmin"]) * g0["e1"]
+            + float(g0["ymin"]) * g0["e2"]
+        )
+        vx_ang = dx * g0["e1"]
+        vy_ang = dy * g0["e2"]
+
+        lattice = np.column_stack((vx_ang, vy_ang, vz_ang))
+        det = float(np.linalg.det(lattice))
+        scale = max(
+            float(np.linalg.norm(vx_ang)),
+            float(np.linalg.norm(vy_ang)),
+            float(np.linalg.norm(vz_ang)),
+            1.0,
+        )
+        if (not np.isfinite(det)) or abs(det) <= 1.0e-10 * (scale ** 3):
+            raise RuntimeError("CUBE export reconstructed a degenerate 3-D PL2D lattice.")
+
+        return {
+            "origin_ang": origin_ang,
+            "vx_ang": vx_ang,
+            "vy_ang": vy_ang,
+            "vz_ang": vz_ang,
+            "nptx": int(nptx),
+            "npty": int(npty),
+            "n_planes": int(n_planes),
+        }
+
+    def _selected_cube_atoms(self, geometry: dict | None = None):
+        """Return validated TRUE atoms for the CUBE atom block.
+
+        Item 22b connects the already parsed TRHO TRUE atoms to the Gaussian
+        CUBE export.  When physical PL2D geometry is supplied, only TRUE atoms
+        located inside the exported scalar-grid parallelepiped are retained.
+        This keeps the structural block spatially consistent with the volume and
+        avoids expanding an external viewer to atoms unrelated to the map.
+
+        Coordinates remain Cartesian Angstrom here; _write_cube_file converts
+        them to bohr together with the CUBE origin/lattice vectors.
+        """
         try:
             parsed = getattr(self.app.ctx, "trho_parsed", None)
             df = getattr(parsed, "df_true_atoms", None) if parsed is not None else None
-            if df is not None and not df.empty:
-                return df.copy()
+            if df is None or df.empty:
+                df = getattr(self.app.state, "df_true_atoms", None)
+            if df is None or df.empty:
+                return pd.DataFrame()
+
+            df = df.copy()
+            required = ("ELEMENT", "X_ANGSTROM", "Y_ANGSTROM", "Z_ANGSTROM")
+            if any(col not in df.columns for col in required):
+                return pd.DataFrame()
+
+            # Normalize/validate atomic numbers and Cartesian coordinates.
+            df["_CUBE_Z"] = pd.to_numeric(df["ELEMENT"], errors="coerce")
+            for col in ("X_ANGSTROM", "Y_ANGSTROM", "Z_ANGSTROM"):
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+            finite = (
+                np.isfinite(df["_CUBE_Z"].to_numpy(dtype=float))
+                & np.isfinite(df["X_ANGSTROM"].to_numpy(dtype=float))
+                & np.isfinite(df["Y_ANGSTROM"].to_numpy(dtype=float))
+                & np.isfinite(df["Z_ANGSTROM"].to_numpy(dtype=float))
+            )
+            df = df.loc[finite].copy()
+            if df.empty:
+                return pd.DataFrame()
+
+            df["_CUBE_Z"] = [
+                int(normalize_atomic_number(v)) for v in df["_CUBE_Z"].tolist()
+            ]
+            df = df[(df["_CUBE_Z"] >= 1) & (df["_CUBE_Z"] <= 118)].copy()
+            if df.empty:
+                return pd.DataFrame()
+
+            if geometry is not None:
+                origin = np.asarray(geometry["origin_ang"], dtype=float)
+                vx = np.asarray(geometry["vx_ang"], dtype=float)
+                vy = np.asarray(geometry["vy_ang"], dtype=float)
+                vz = np.asarray(geometry["vz_ang"], dtype=float)
+                lattice = np.column_stack((vx, vy, vz))
+
+                if lattice.shape != (3, 3) or not np.all(np.isfinite(lattice)):
+                    raise RuntimeError("Invalid CUBE lattice while selecting TRUE atoms.")
+                if abs(float(np.linalg.det(lattice))) <= 1.0e-12:
+                    raise RuntimeError("Degenerate CUBE lattice while selecting TRUE atoms.")
+
+                nmax = np.asarray([
+                    int(geometry["nptx"]) - 1,
+                    int(geometry["npty"]) - 1,
+                    int(geometry["n_planes"]) - 1,
+                ], dtype=float)
+
+                keep = []
+                # A small index-space tolerance prevents a numerically boundary
+                # atom from being lost because coordinates originate in two
+                # independently parsed text files.
+                tol_index = 0.35
+                for _idx, row in df.iterrows():
+                    pos = np.asarray([
+                        float(row["X_ANGSTROM"]),
+                        float(row["Y_ANGSTROM"]),
+                        float(row["Z_ANGSTROM"]),
+                    ], dtype=float)
+                    coeff = np.linalg.solve(lattice, pos - origin)
+                    inside = bool(
+                        np.all(coeff >= -tol_index)
+                        and np.all(coeff <= (nmax + tol_index))
+                    )
+                    keep.append(inside)
+
+                df = df.loc[np.asarray(keep, dtype=bool)].copy()
+
+            return df
         except Exception:
-            pass
-        return pd.DataFrame()
+            return pd.DataFrame()
 
-    def _write_cube_file(self, cube_path: Path, vol: np.ndarray, x_coords, y_coords, z_coords, *, surf: str, run_dir: Path):
-        """Write a Gaussian CUBE file for the selected PL2D scalar volume.
+    def _write_cube_file(
+        self,
+        cube_path: Path,
+        vol: np.ndarray,
+        geometry: dict,
+        *,
+        surf: str,
+        run_dir: Path,
+        atoms_df: pd.DataFrame | None = None,
+    ):
+        """Write a Gaussian CUBE with physical PL2D geometry and TRUE atoms.
 
-        The CUBE export contains only the scalar grid. It intentionally does not
-        export atoms, BCPs, bond paths or any other TopIso3D overlay because those
-        objects may not share the same reference frame as the PL2D grid and could
-        be misinterpreted by external viewers. Isosurface levels must be chosen
-        in the external viewer (for example VESTA). The HTML export remains the
-        faithful export of the current TopIso3D visualization settings.
+        Item 22a reconstructs the physical regular 3-D lattice from the PL2D
+        planes. Item 22b writes the TRUE atoms lying inside that volume into the
+        standard CUBE atom block. Atomic numbers and Cartesian coordinates are
+        written in bohr, matching the positive voxel-count convention used here.
         """
         bohr_to_ang = 0.529177210903
         ang_to_bohr = 1.0 / bohr_to_ang
 
         n_planes, nptx, npty = [int(v) for v in vol.shape]
-        if nptx < 2 or npty < 2 or n_planes < 2:
-            raise RuntimeError("CUBE export requires at least two grid points along x, y and z.")
+        if (
+            int(geometry.get("nptx", -1)) != nptx
+            or int(geometry.get("npty", -1)) != npty
+            or int(geometry.get("n_planes", -1)) != n_planes
+        ):
+            raise RuntimeError("CUBE geometry dimensions do not match the loaded PL2D scalar volume.")
 
-        x_coords = np.asarray(x_coords, dtype=float)
-        y_coords = np.asarray(y_coords, dtype=float)
-        z_coords = np.asarray(z_coords, dtype=float)
+        expected_values = int(n_planes) * int(nptx) * int(npty)
+        if int(np.asarray(vol).size) != expected_values:
+            raise RuntimeError(
+                f"CUBE scalar-grid size mismatch: got {int(np.asarray(vol).size)}, "
+                f"expected {expected_values}."
+            )
+        if not np.all(np.isfinite(np.asarray(vol, dtype=float))):
+            raise RuntimeError("CUBE scalar grid contains non-finite values.")
 
-        origin_ang = np.array([float(x_coords[0]), float(y_coords[0]), float(z_coords[0])], dtype=float)
-        vx_ang = np.array([(float(x_coords[-1]) - float(x_coords[0])) / float(nptx - 1), 0.0, 0.0], dtype=float)
-        vy_ang = np.array([0.0, (float(y_coords[-1]) - float(y_coords[0])) / float(npty - 1), 0.0], dtype=float)
-        vz_ang = np.array([0.0, 0.0, (float(z_coords[-1]) - float(z_coords[0])) / float(n_planes - 1)], dtype=float)
+        origin_ang = np.asarray(geometry["origin_ang"], dtype=float)
+        vx_ang = np.asarray(geometry["vx_ang"], dtype=float)
+        vy_ang = np.asarray(geometry["vy_ang"], dtype=float)
+        vz_ang = np.asarray(geometry["vz_ang"], dtype=float)
+        for name, vec in (("origin", origin_ang), ("vx", vx_ang), ("vy", vy_ang), ("vz", vz_ang)):
+            if vec.shape != (3,) or not np.all(np.isfinite(vec)):
+                raise RuntimeError(f"Invalid CUBE {name} vector reconstructed from PL2D geometry.")
+
+        atom_records = []
+        if atoms_df is not None and hasattr(atoms_df, "empty") and not atoms_df.empty:
+            for _idx, row in atoms_df.iterrows():
+                try:
+                    z = int(row.get("_CUBE_Z", normalize_atomic_number(row.get("ELEMENT"))))
+                    xyz_ang = np.asarray([
+                        float(row["X_ANGSTROM"]),
+                        float(row["Y_ANGSTROM"]),
+                        float(row["Z_ANGSTROM"]),
+                    ], dtype=float)
+                    if not (1 <= z <= 118) or not np.all(np.isfinite(xyz_ang)):
+                        continue
+                    atom_records.append((z, float(z), xyz_ang * ang_to_bohr))
+                except Exception:
+                    continue
 
         cube_path = Path(cube_path)
         cube_path.parent.mkdir(parents=True, exist_ok=True)
         with cube_path.open("w", encoding="utf-8") as f:
             f.write(f"TopIso3D PL2D scalar-grid CUBE export: {surf}\n")
-            f.write(f"Run: {Path(run_dir).name} | No atoms exported | Source grid: PL2D SURF*.DAT\n")
+            f.write(
+                f"Run: {Path(run_dir).name} | Physical PL2D lattice | "
+                f"TRUE atoms in volume: {len(atom_records)}\n"
+            )
+
             org = origin_ang * ang_to_bohr
-            f.write(f"{0:5d} {org[0]:13.6f} {org[1]:13.6f} {org[2]:13.6f}\n")
             vx = vx_ang * ang_to_bohr
             vy = vy_ang * ang_to_bohr
             vz = vz_ang * ang_to_bohr
+
+            # Standard Gaussian CUBE header. Positive voxel counts indicate that
+            # origin, lattice vectors, and atomic coordinates are in bohr.
+            f.write(f"{len(atom_records):5d} {org[0]:13.6f} {org[1]:13.6f} {org[2]:13.6f}\n")
             f.write(f"{nptx:5d} {vx[0]:13.6f} {vx[1]:13.6f} {vx[2]:13.6f}\n")
             f.write(f"{npty:5d} {vy[0]:13.6f} {vy[1]:13.6f} {vy[2]:13.6f}\n")
             f.write(f"{n_planes:5d} {vz[0]:13.6f} {vz[1]:13.6f} {vz[2]:13.6f}\n")
 
+            # Atom block: atomic number, nuclear charge, x, y, z.
+            for z, charge, xyz_bohr in atom_records:
+                f.write(
+                    f"{z:5d} {charge:13.6f} "
+                    f"{xyz_bohr[0]:13.6f} {xyz_bohr[1]:13.6f} {xyz_bohr[2]:13.6f}\n"
+                )
+
             vals_on_line = 0
+            # CUBE ordering: the third lattice index varies fastest. The PL2D
+            # volume is stored as [slice, x, y], so write x -> y -> slice.
             for ix in range(nptx):
                 for iy in range(npty):
                     for iz in range(n_planes):
@@ -12791,6 +13167,8 @@ class PL2DViewerPage(BasePage):
                             vals_on_line = 0
             if vals_on_line:
                 f.write("\n")
+
+        return len(atom_records)
 
     def _export_cube(self):
         rd = self._current_run_dir()
@@ -12807,7 +13185,8 @@ class PL2DViewerPage(BasePage):
         try:
             vol = self._load_volume(rd, surf, compute_only_minmax=False)
             n_planes, nptx, npty = vol.shape
-            x_coords, y_coords, z_coords = self._pl2d_grid_coordinates(rd, n_planes, nptx, npty)
+            geometry = self._pl2d_cube_geometry(rd, n_planes, nptx, npty)
+            atoms_df = self._selected_cube_atoms(geometry)
 
             def _sanitize(name: str) -> str:
                 return re.sub(r"[^A-Za-z0-9_-]+", "_", str(name or "")).strip("_") or "pl2d"
@@ -12823,12 +13202,23 @@ class PL2DViewerPage(BasePage):
             )
             if not target:
                 return
-            self._write_cube_file(Path(target), vol, x_coords, y_coords, z_coords, surf=surf, run_dir=rd)
-            self.lbl_status.config(text=f"Saved CUBE scalar grid: {Path(target).name}")
+
+            n_atoms = self._write_cube_file(
+                Path(target),
+                vol,
+                geometry,
+                surf=surf,
+                run_dir=rd,
+                atoms_df=atoms_df,
+            )
+            self.lbl_status.config(
+                text=f"Saved CUBE scalar grid: {Path(target).name} | TRUE atoms: {n_atoms}"
+            )
             messagebox.showinfo(
                 "PL2D Viewer",
-                "CUBE scalar grid saved successfully.\n\n"
-                "No atoms or TopIso3D overlays were exported. Choose the isosurface value directly in the external viewer.\n\n"
+                "CUBE scalar grid saved successfully with the physical PL2D lattice geometry.\n\n"
+                f"TRUE atoms inside the exported volume: {n_atoms}.\n"
+                "Choose the isosurface value directly in the external viewer.\n\n"
                 f"{target}",
                 parent=self,
             )
