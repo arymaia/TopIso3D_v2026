@@ -22,7 +22,7 @@ Project
 -------
 TopIso3D
 Version: v2026.1
-Website: https://www.topiso3d.ufpb.br
+Website: http://www.topiso3d.ufpb.br
 Repository: https://github.com/arymaia/TopIso3D_v2026
 
 License
@@ -330,7 +330,7 @@ def get_runtime_base_dir() -> Path:
 
 
 def collect_system_diagnostics(app: Optional["App"] = None) -> dict:
-    """Collect lightweight diagnostics useful for first real Mac tests."""
+    """Collect lightweight diagnostics useful for troubleshooting."""
     diag = {
         "platform_name": get_platform_name(),
         "platform_system": platform.system(),
@@ -553,7 +553,7 @@ def configure_windows_app_id() -> None:
         return
     try:
         import ctypes
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("TopIso3D.v2026")
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("TopIso3D.v2026.1")
     except Exception:
         pass
 
@@ -3133,7 +3133,7 @@ def parse_tlap_out(
 
 
 class SettingsDialog(tk.Toplevel):
-    """Minimal Settings dialog (Phase 0): only 'properties' executable path."""
+    """Settings dialog for executables, visualization, cleanup, and output aliases."""
     def __init__(self, app: "App"):
         super().__init__(app)
         self.app = app
@@ -3493,7 +3493,7 @@ def _ask_run_name(parent, title: str, prompt: str, initialvalue: str = ""):
 
 class App(tk.Tk):
     def __init__(self):
-        super().__init__()
+        super().__init__(className="TopIso3D")
         self._applied_tk_scaling = apply_platform_ui_scaling(self)
         self.withdraw()
         self._splash_win = None
@@ -3502,7 +3502,7 @@ class App(tk.Tk):
 
         _ensure_floating_window(self)
         configure_windows_app_id()
-        self.title("TopIso3D v2026")
+        self.title("TopIso3D v2026.1")
         apply_topiso3d_window_icon(self)
         self._show_startup_splash()
 
@@ -3591,7 +3591,7 @@ class App(tk.Tk):
             self._splash_start_time = time.perf_counter()
             splash = tk.Toplevel(self)
             self._splash_win = splash
-            splash.title("TopIso3D v2026")
+            splash.title("TopIso3D v2026.1")
             apply_topiso3d_window_icon(splash)
             splash.configure(bg=UI_BG_MAIN)
             splash.resizable(False, False)
@@ -3621,7 +3621,7 @@ class App(tk.Tk):
             header.pack(fill="x")
             tk.Label(
                 header,
-                text="TopIso3D v2026",
+                text="TopIso3D v2026.1",
                 bg=UI_BG_DARK,
                 fg=UI_ACCENT,
                 font=("Arial", 20, "bold"),
@@ -3791,7 +3791,7 @@ class App(tk.Tk):
             self._ui_title_family = "TkDefaultFont"
 
     def _apply_theme(self):
-        """Apply a v2-like color palette with platform-tuned fonts and spacing."""
+        """Apply the TopIso3D color palette with platform-tuned fonts and spacing."""
         try:
             style = ttk.Style(self)
             try:
@@ -3883,7 +3883,7 @@ class App(tk.Tk):
         self.sidebar.rowconfigure(4, weight=1)
 
 
-        ttk.Label(self.sidebar, text="TopIso3D v2026", style="TitleCenter.TLabel").grid(
+        ttk.Label(self.sidebar, text="TopIso3D v2026.1", style="TitleCenter.TLabel").grid(
             row=0, column=0, sticky="ew"
         )
 
@@ -5505,7 +5505,7 @@ class App(tk.Tk):
                 self._job_queue.put(("log", f"[TRHO] inp: {inp_path.name}"))
                 self._job_queue.put(("log", f"[TRHO] out: {out_path.name}"))
 
-                # Item 38: finish writing and close trho.out before parsing it.
+                # Close trho.out before parsing so buffered output is fully available.
                 # This avoids platform-dependent buffered I/O exposing a partial
                 # file to parse_trho_out() immediately after properties exits.
                 with open(inp_path, "r", encoding="utf-8") as fin, open(out_path, "w", encoding="utf-8") as fout:
@@ -5558,7 +5558,7 @@ class App(tk.Tk):
                         self._job_queue.put(("trho_issue", issue, str(trho_dir)))
                         return
 
-                    # Item 39: parse this newly completed run locally first.
+                    # Parse the newly completed run before publishing it as active.
                     # The shared scientific cache must continue to represent the
                     # confirmed Active TRHO run until the user promotes this run.
                     try:
@@ -5685,11 +5685,8 @@ class App(tk.Tk):
                 self._job_queue.put(("log", f"[TLAP] inp: {inp_path.name}"))
                 self._job_queue.put(("log", f"[TLAP] out: {out_path.name}"))
 
-                # Item 38 (expanded): never publish/process TLAP output while
-                # tlap.out is still open for buffered writing.  On Windows the
-                # main Tk thread can consume tlap_done immediately, so queuing
-                # that event inside this with-block creates a race in which the
-                # parser may read a partial file.
+                # Close tlap.out before publishing or parsing it; otherwise buffered
+                # writes can expose a partial file to the UI, especially on Windows.
                 with open(inp_path, "r", encoding="utf-8") as fin, open(out_path, "w", encoding="utf-8") as fout:
                     p = subprocess.Popen(
                         [str(exe_path)],
@@ -6279,7 +6276,7 @@ class App(tk.Tk):
 
         ttk.Label(
             body,
-            text="TopIso3D v2026 — Documentation and Support",
+            text="TopIso3D v2026.1 — Documentation and Support",
             font=("TkDefaultFont", 13, "bold"),
         ).grid(row=0, column=0, sticky="w", pady=(0, 12))
 
@@ -6392,7 +6389,7 @@ class App(tk.Tk):
         ttk.Button(
             resources,
             text="TopIso3D Website",
-            command=lambda: _open_url("https://www.topiso3d.ufpb.br"),
+            command=lambda: _open_url("http://www.topiso3d.ufpb.br"),
         ).grid(row=0, column=0, sticky="ew", padx=(0, 6), pady=(0, 8))
 
         ttk.Button(
@@ -6521,7 +6518,7 @@ class App(tk.Tk):
 
         ttk.Label(
             body,
-            text="TopIso3D v2026",
+            text="TopIso3D v2026.1",
             font=("TkDefaultFont", 15, "bold"),
         ).grid(row=0, column=0, sticky="w", pady=(0, 6))
 
@@ -6581,7 +6578,7 @@ class App(tk.Tk):
         ttk.Button(
             btns,
             text="TopIso3D Website",
-            command=lambda: _open_url("https://www.topiso3d.ufpb.br"),
+            command=lambda: _open_url("http://www.topiso3d.ufpb.br"),
         ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
 
         ttk.Button(
@@ -7284,10 +7281,8 @@ class App(tk.Tk):
                 except Exception:
                     pass
 
-                # Item 38 (expanded): close atbp.out before inspecting/parsing
-                # it.  Reading it from inside the same buffered write context can
-                # expose only a prefix of the output on Windows and trigger a
-                # false "no charge values" protection warning.
+                # Close atbp.out before inspecting or parsing it so buffered writes
+                # cannot expose a partial output file to the UI.
                 with open(inp_path, "r", encoding="utf-8") as fin, open(out_path, "w", encoding="utf-8") as fout:
                     p = subprocess.Popen(
                         [str(exe_path)],
@@ -10577,15 +10572,7 @@ class TLAPPage(BasePage):
 
 
 class PL2DPage(BasePage):
-    """PL2D configuration + runner (v2026)
-
-    Design goals:
-    - User defines XY square region by x_min, y_min, L (side length), and a single xy_inc.
-    - The app snaps L to the nearest grid so Nx == Ny always.
-    - Z region by z_min, z_max and n_slices (10..200).
-    - Outputs are .DAT slices for selected isosurface types.
-    - Existing runs are reused ONLY if the full parameter signature matches (manifest hash).
-    """
+    """PL2D configuration, execution, and campaign management."""
 
     ISO_TYPES = [
         ("SURFRHOO", "ρ (electron density)"),
@@ -11658,7 +11645,7 @@ def _write_pl2d_unix_scripts(self, run_dir: Path, cfg: dict) -> None:
 
 
 def _export_pl2d_campaign(self):
-    """Phase 2: generate a full PL2D campaign without executing properties locally."""
+    """Generate a full PL2D campaign without executing properties locally."""
     if not (getattr(self.app.state, "workspace_compute_ok", False) and self.app.state.trho_parsed is not None):
         messagebox.showwarning("PL2D", "PL2D requires a parsed TRHO result and fort.9 or *.f9/*.9 in the workspace.")
         return
@@ -12024,14 +12011,7 @@ PL2DPage._cleanup_pl2d_slice_temp_files = _cleanup_pl2d_slice_temp_files
 PL2DPage._run_pl2d = _run_pl2d
 
 class PL2DViewerPage(BasePage):
-    """PL2D Project Viewer (v2-like logic, minimal refactor)
-
-    Goals:
-    - List existing PL2D runs inside workspace/pl2d_runs/
-    - Auto-detect number of slices from the folder structure (no manual selection)
-    - Default opacity = 0.2 (later to Settings)
-    - Render an Isosurface from selected SURF*.DAT using Plotly
-    """
+    """Viewer for existing PL2D campaigns and SURF*.DAT isosurfaces."""
 
     title = "PL2D Viewer"
 
@@ -14625,7 +14605,7 @@ class ReportViewerWindow(tk.Toplevel):
         super().__init__(app)
         self.app = app
         _ensure_floating_window(self)
-        self.title("TopIso3D v2026 — Reports Viewer")
+        self.title("TopIso3D v2026.1 — Reports Viewer")
         self.geometry("1100x720")
         self.minsize(980, 600)
         self.protocol("WM_DELETE_WINDOW", self._on_close)

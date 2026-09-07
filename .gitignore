@@ -16,3 +16,4 @@ topsio_env/
 .idea/
 venv_topiso3d_v2026/
 github-recovery-codes.txt
+*.AppDir/
